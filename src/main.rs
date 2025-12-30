@@ -242,14 +242,13 @@ fn parse_xbel_stream(xml: &str) -> Result<HashMap<String, Bookmark>> {
 
     let mut reader = Reader::from_str(xml);
     reader.trim_text(true);
-    reader.expand_empty_elements(true); // <tag/> 会触发 Start 和 End
+    reader.expand_empty_elements(true);
 
     let mut buf = Vec::new();
     let mut map = HashMap::new();
     let mut path_stack: Vec<String> = Vec::new();
     let mut global_counter: u64 = 0;
 
-    // 状态机
     let mut current_href: Option<String> = None;
     let mut in_title = false;
 
@@ -258,18 +257,17 @@ fn parse_xbel_stream(xml: &str) -> Result<HashMap<String, Bookmark>> {
             Ok(Event::Start(e)) => {
                 match e.name().as_ref() {
                     b"folder" => {
-                        // 遇到文件夹先压入占位符，等读到 title 再更新
                         path_stack.push("Untitled".to_string());
                     }
                     b"bookmark" => {
-                        // 提取 href
                         for attr in e.attributes() {
                             if let Ok(a) = attr {
                                 if a.key.as_ref() == b"href" {
-                                    let val = a.value;
-                                    // 尝试解码 href
-                                    let s = String::from_utf8_lossy(&val).to_string();
-                                    current_href = Some(s);
+                                    // 获取原始字符串
+                                    let raw = String::from_utf8_lossy(&a.value).to_string();
+                                    // 🔥 强力清洗
+                                    let clean = html_decode(&raw);
+                                    current_href = Some(clean);
                                 }
                             }
                         }
@@ -280,23 +278,12 @@ fn parse_xbel_stream(xml: &str) -> Result<HashMap<String, Bookmark>> {
                     _ => {}
                 }
             }
+            // ... (中间 Text 和 End 逻辑保持不变) ...
             Ok(Event::Text(e)) => {
                 if in_title {
                     let txt = e.unescape()?.to_string();
                     if let Some(ref href) = current_href {
-                        // 这是 Bookmark 的标题
-                        // 我们直接在这里插入吗？不，最好等 End(bookmark)
-                        // 但为了简化，我们可以先把标题存起来。
-                        // 或者更简单的策略：因为 bookmark 结构简单，我们就在这里拿到标题后直接插入 map
-                        // 并标记“已处理”。
-                        // 不过为了逻辑严谨，我们还是把 title 暂存到 Stack 顶部？不，书签和文件夹层级不一样。
-
-                        // 简化策略：
-                        // 如果我们在 bookmark 里，这个 text 就是 bookmark title。
-                        // 我们直接构造 bookmark。
                         global_counter += 1;
-
-                        // 过滤掉系统文件夹
                         let filtered_path: Vec<String> = path_stack
                             .iter()
                             .filter(|p| {
@@ -304,7 +291,6 @@ fn parse_xbel_stream(xml: &str) -> Result<HashMap<String, Bookmark>> {
                             })
                             .cloned()
                             .collect();
-
                         map.insert(
                             href.clone(),
                             Bookmark {
@@ -314,65 +300,94 @@ fn parse_xbel_stream(xml: &str) -> Result<HashMap<String, Bookmark>> {
                                 order_id: global_counter,
                             },
                         );
-
-                        // 消费掉 href，防止重复插入 (虽然 XBEL 一般只有一个 title)
-                        // current_href = None; // 不，等待 End 标签重置更安全
                     } else {
-                        // 这是 Folder 的标题
-                        // 更新栈顶文件夹的名字
                         if let Some(last) = path_stack.last_mut() {
                             *last = txt;
                         }
                     }
                 }
             }
-            Ok(Event::End(e)) => {
-                match e.name().as_ref() {
-                    b"folder" => {
-                        path_stack.pop();
-                    }
-                    b"bookmark" => {
-                        // 如果书签没有 title 标签（罕见），我们用 href 当 title 插入
-                        if let Some(href) = current_href.take() {
-                            if !map.contains_key(&href) {
-                                global_counter += 1;
-                                let filtered_path: Vec<String> = path_stack
-                                    .iter()
-                                    .filter(|p| {
-                                        *p != FOLDER_BAR && *p != FOLDER_MENU && *p != FOLDER_MOBILE
-                                    })
-                                    .cloned()
-                                    .collect();
-                                map.insert(
-                                    href.clone(),
-                                    Bookmark {
-                                        url: href.clone(),
-                                        title: href, // Fallback title
-                                        path: filtered_path,
-                                        order_id: global_counter,
-                                    },
-                                );
-                            }
+            Ok(Event::End(e)) => match e.name().as_ref() {
+                b"folder" => {
+                    path_stack.pop();
+                }
+                b"bookmark" => {
+                    if let Some(href) = current_href.take() {
+                        if !map.contains_key(&href) {
+                            global_counter += 1;
+                            let filtered_path: Vec<String> = path_stack
+                                .iter()
+                                .filter(|p| {
+                                    *p != FOLDER_BAR && *p != FOLDER_MENU && *p != FOLDER_MOBILE
+                                })
+                                .cloned()
+                                .collect();
+                            map.insert(
+                                href.clone(),
+                                Bookmark {
+                                    url: href.clone(),
+                                    title: href,
+                                    path: filtered_path,
+                                    order_id: global_counter,
+                                },
+                            );
                         }
                     }
-                    b"title" => {
-                        in_title = false;
-                    }
-                    _ => {}
                 }
-            }
+                b"title" => {
+                    in_title = false;
+                }
+                _ => {}
+            },
             Ok(Event::Eof) => break,
-            Err(e) => {
-                // 如果遇到 DTD 错误，quick-xml 通常会忽略或者作为 Decl 处理
-                // 如果报错，说明 XML 结构真的有问题
-                return Err(anyhow::anyhow!("XML parsing error: {:?}", e));
-            }
             _ => {}
         }
         buf.clear();
     }
-
     Ok(map)
+}
+
+fn html_decode(s: &str) -> String {
+    // 1. 快速通道：如果没有 '&'，说明完全无需处理，直接返回
+    if !s.contains('&') {
+        return s.to_string();
+    }
+
+    let mut current = s.to_string();
+
+    // 安全计数器：防止极其罕见的恶意构造（可选，但在生产环境建议保留）
+    let mut limit = 0;
+
+    loop {
+        // 2. 预检查：如果这一轮连 '&' 都没了，肯定干净了
+        if !current.contains('&') {
+            break;
+        }
+
+        // 3. 执行替换
+        let next = current
+            .replace("&amp;", "&")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&apos;", "'");
+
+        // 4. 核心退出条件：如果替换了一轮，内容没变，说明已经是最简形式（Raw URL）
+        // 即使它里面还有 '&' (比如参数分隔符)，也应该停止了
+        if next == current {
+            break;
+        }
+
+        current = next;
+
+        // 防止意外死循环保底 (比如某种特殊编码攻击)
+        limit += 1;
+        if limit > 10 {
+            break;
+        }
+    }
+
+    current
 }
 
 fn parse_qutebrowser_file(path: &PathBuf) -> Result<HashMap<String, Bookmark>> {
