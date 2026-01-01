@@ -9,7 +9,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Cursor};
 use std::path::PathBuf;
-use std::time::SystemTime;
+use std::thread;
+use std::time::{Duration, SystemTime};
 
 // ==========================================
 // 配置与常量
@@ -18,6 +19,7 @@ use std::time::SystemTime;
 #[derive(Debug, Deserialize)]
 struct AppConfig {
     local_path: Option<String>,
+    interval: Option<u64>,
     webdav: WebDavConfig,
 }
 
@@ -54,46 +56,38 @@ impl PartialEq for Bookmark {
 // ==========================================
 
 fn main() -> Result<()> {
-    println!("🚀 Starting qb-floccus (v0.10.0)...");
-
-    // 1. 加载配置
+    // 1. 基础环境准备
     let home = dirs::home_dir().context("No home dir")?;
-    // 定义 Qutebrowser 的配置根目录 (跨平台策略)
+
+    // Qutebrowser 配置目录
     let qb_config_dir = if cfg!(target_os = "windows") {
-        // Windows: %APPDATA%/qutebrowser/
         home.join("AppData").join("Roaming").join("qutebrowser")
     } else {
-        // Linux/Mac: ~/.config/qutebrowser/
         home.join(".config").join("qutebrowser")
     };
-    // 配置文件名：qb-floccus.toml (放在 qutebrowser 目录下)
+
+    // 2. 加载配置
     let config_file = qb_config_dir.join("qb-floccus.toml");
     if !config_file.exists() {
         return Err(anyhow::anyhow!(
-            "Config file not found!\nPlease create: {:?}\n\nExample content:\n[webdav]\nurl = '...'\nusername = '...'\npassword = '...'", 
+            "Config file not found!\nPlease create: {:?}\n\nExample content:\n[webdav]\nurl = '...'\nusername = '...'\npassword = '...'",
             config_file
         ));
     }
+
     println!("⚙️  Loading config: {:?}", config_file);
     let config_content = fs::read_to_string(&config_file)?;
     let config: AppConfig = toml::from_str(&config_content)?;
 
-    let raw_url = config.webdav.url.trim();
-    let target_url = if raw_url.to_lowercase().ends_with(".xbel") {
-        raw_url.to_string()
-    } else {
-        let base = raw_url.trim_end_matches('/');
-        format!("{}/bookmarks.xbel", base)
-    };
-
-    // 如果配置文件里没写 local_path，就默认在同一个目录下找 bookmarks/urls
-    let qb_file_path = if let Some(p) = config.local_path {
+    // 3. 计算关键路径
+    // 本地书签路径
+    let qb_file_path = if let Some(p) = &config.local_path {
         PathBuf::from(p)
     } else {
-        // 默认: ~/.config/qutebrowser/bookmarks/urls
         qb_config_dir.join("bookmarks").join("urls")
     };
-    // 快照文件路径遵循 XDG Cache 规范：
+
+    // 快照路径 (XDG Cache)
     let cache_dir = if cfg!(target_os = "windows") {
         home.join("AppData").join("Local").join("qb-floccus")
     } else {
@@ -104,26 +98,71 @@ fn main() -> Result<()> {
     }
     let snapshot_path = cache_dir.join("snapshot.json");
 
-    // 2. 读取本地
+    // 4. URL 标准化预处理
+    let raw_url = config.webdav.url.trim();
+    let target_url = if raw_url.to_lowercase().ends_with(".xbel") {
+        raw_url.to_string()
+    } else {
+        let base = raw_url.trim_end_matches('/');
+        format!("{}/bookmarks.xbel", base)
+    };
+
+    // 5. 调度逻辑 (单次运行 或 守护进程)
+    match config.interval {
+        Some(secs) if secs > 0 => {
+            println!(
+                "🚀 Starting qb-floccus in DAEMON mode (Interval: {}s)...",
+                secs
+            );
+            loop {
+                // 在循环中捕获错误，防止单次网络波动导致进程崩溃退出
+                match sync_once(&config, &target_url, &qb_file_path, &snapshot_path) {
+                    Ok(_) => println!("✅ Sync cycle finished. Sleeping for {}s...", secs),
+                    Err(e) => eprintln!("❌ Sync failed: {:#?}\n   Retrying in {}s...", e, secs),
+                }
+                thread::sleep(Duration::from_secs(secs));
+            }
+        }
+        _ => {
+            println!("🚀 Starting qb-floccus (Run-Once mode)...");
+            // 单次模式直接抛出错误
+            sync_once(&config, &target_url, &qb_file_path, &snapshot_path)?;
+        }
+    }
+
+    Ok(())
+}
+
+// ==========================================
+// 核心同步逻辑 (Sync Once)
+// ==========================================
+
+fn sync_once(
+    config: &AppConfig,
+    target_url: &str,
+    qb_file_path: &PathBuf,
+    snapshot_path: &PathBuf,
+) -> Result<()> {
+    // 1. 读取本地
     println!("📂 Reading local: {:?}", qb_file_path);
-    let local_map = parse_qutebrowser_file(&qb_file_path).unwrap_or_default();
-    let local_mtime = fs::metadata(&qb_file_path)
+    let local_map = parse_qutebrowser_file(qb_file_path).unwrap_or_default();
+    let local_mtime = fs::metadata(qb_file_path)
         .and_then(|m| m.modified())
         .unwrap_or(SystemTime::UNIX_EPOCH);
 
-    // 3. 读取快照
+    // 2. 读取快照
     let snapshot_map: HashMap<String, Bookmark> = if snapshot_path.exists() {
-        let f = File::open(&snapshot_path)?;
+        let f = File::open(snapshot_path)?;
         serde_json::from_reader(BufReader::new(f)).unwrap_or_default()
     } else {
         HashMap::new()
     };
 
-    // 4. 读取远程
+    // 3. 读取远程
     println!("☁️  Fetching remote: {}", target_url);
     let client = Client::new();
     let resp = client
-        .get(&target_url)
+        .get(target_url)
         .basic_auth(&config.webdav.username, Some(&config.webdav.password))
         .send()
         .context("WebDAV connect fail")?;
@@ -143,7 +182,7 @@ fn main() -> Result<()> {
         String::new()
     };
 
-    // 解析远程 (使用新解析器)
+    // 解析远程
     let remote_map = parse_xbel_stream(&remote_xml)?;
 
     println!(
@@ -153,6 +192,7 @@ fn main() -> Result<()> {
         snapshot_map.len()
     );
 
+    // 熔断保护
     if status.is_success()
         && !remote_xml.is_empty()
         && remote_map.is_empty()
@@ -163,7 +203,7 @@ fn main() -> Result<()> {
         ));
     }
 
-    // 5. 合并
+    // 4. 合并逻辑
     let mut final_map = HashMap::new();
     let mut all_urls: HashSet<String> = HashSet::new();
     all_urls.extend(local_map.keys().cloned());
@@ -231,26 +271,26 @@ fn main() -> Result<()> {
 
     println!("✨ Final count: {}", final_map.len());
 
-    // 6. 写入本地
+    // 5. 写入本地
     let qb_content = generate_sorted_qutebrowser_content(&final_map);
-    fs::write(&qb_file_path, qb_content).context("Write local fail")?;
+    fs::write(qb_file_path, qb_content).context("Write local fail")?;
 
-    // 7. 写入远程
+    // 6. 写入远程
     let xbel_content = generate_xbel_content(&final_map)?;
     if xbel_content.len() < 100 && final_map.len() > 2 {
         return Err(anyhow::anyhow!("Generated XBEL too small."));
     }
     client
-        .put(&target_url)
+        .put(target_url)
         .basic_auth(&config.webdav.username, Some(&config.webdav.password))
         .body(xbel_content)
         .send()
         .context("Upload XBEL fail")?;
 
-    let f = File::create(&snapshot_path)?;
+    // 7. 更新快照
+    let f = File::create(snapshot_path)?;
     serde_json::to_writer(f, &final_map)?;
 
-    println!("✅ Done.");
     Ok(())
 }
 
