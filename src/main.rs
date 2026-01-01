@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
-use quick_xml::reader::Reader; // 引入 Reader
+use quick_xml::reader::Reader;
 use quick_xml::writer::Writer;
 use reqwest::blocking::Client;
 use reqwest::header::LAST_MODIFIED;
@@ -54,17 +54,29 @@ impl PartialEq for Bookmark {
 // ==========================================
 
 fn main() -> Result<()> {
-    println!("🚀 Starting qb-sync (v0.9.0 - QuickXML Stream Parser)...");
+    println!("🚀 Starting qb-floccus (v0.10.0)...");
 
     // 1. 加载配置
     let home = dirs::home_dir().context("No home dir")?;
-    let config_dir = home.join(".config/qb-sync");
-    let config_file = config_dir.join("config.toml");
-
+    // 定义 Qutebrowser 的配置根目录 (跨平台策略)
+    let qb_config_dir = if cfg!(target_os = "windows") {
+        // Windows: %APPDATA%/qutebrowser/
+        home.join("AppData").join("Roaming").join("qutebrowser")
+    } else {
+        // Linux/Mac: ~/.config/qutebrowser/
+        home.join(".config").join("qutebrowser")
+    };
+    // 配置文件名：qb-floccus.toml (放在 qutebrowser 目录下)
+    let config_file = qb_config_dir.join("qb-floccus.toml");
     if !config_file.exists() {
-        return Err(anyhow::anyhow!("Config missing: {:?}", config_file));
+        return Err(anyhow::anyhow!(
+            "Config file not found!\nPlease create: {:?}\n\nExample content:\n[webdav]\nurl = '...'\nusername = '...'\npassword = '...'", 
+            config_file
+        ));
     }
-    let config: AppConfig = toml::from_str(&fs::read_to_string(&config_file)?)?;
+    println!("⚙️  Loading config: {:?}", config_file);
+    let config_content = fs::read_to_string(&config_file)?;
+    let config: AppConfig = toml::from_str(&config_content)?;
 
     let raw_url = config.webdav.url.trim();
     let target_url = if raw_url.to_lowercase().ends_with(".xbel") {
@@ -74,12 +86,23 @@ fn main() -> Result<()> {
         format!("{}/bookmarks.xbel", base)
     };
 
+    // 如果配置文件里没写 local_path，就默认在同一个目录下找 bookmarks/urls
     let qb_file_path = if let Some(p) = config.local_path {
         PathBuf::from(p)
     } else {
-        home.join(".config/qutebrowser/bookmarks/urls")
+        // 默认: ~/.config/qutebrowser/bookmarks/urls
+        qb_config_dir.join("bookmarks").join("urls")
     };
-    let snapshot_path = config_dir.join("snapshot.json");
+    // 快照文件路径遵循 XDG Cache 规范：
+    let cache_dir = if cfg!(target_os = "windows") {
+        home.join("AppData").join("Local").join("qb-floccus")
+    } else {
+        home.join(".cache").join("qb-floccus")
+    };
+    if !cache_dir.exists() {
+        fs::create_dir_all(&cache_dir)?;
+    }
+    let snapshot_path = cache_dir.join("snapshot.json");
 
     // 2. 读取本地
     println!("📂 Reading local: {:?}", qb_file_path);
@@ -278,7 +301,6 @@ fn parse_xbel_stream(xml: &str) -> Result<HashMap<String, Bookmark>> {
                     _ => {}
                 }
             }
-            // ... (中间 Text 和 End 逻辑保持不变) ...
             Ok(Event::Text(e)) => {
                 if in_title {
                     let txt = e.unescape()?.to_string();

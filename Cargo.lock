@@ -718,8 +718,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "qb-sync"
-version = "0.8.0"
+name = "qb-floccus"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "chrono",

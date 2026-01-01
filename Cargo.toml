@@ -1,6 +1,6 @@
 [package]
-name = "qb-sync"
-version = "0.8.0"
+name = "qb-floccus"
+version = "0.10.0"
 edition = "2021"
 
 [dependencies]
