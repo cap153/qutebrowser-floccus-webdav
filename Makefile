@@ -18,6 +18,7 @@ build:
 install: build
 	@echo "📦 Installing binary to $(BIN_DIR)..."
 	@mkdir -p $(BIN_DIR)
+	@rm $(BIN_DIR)/qb-floccus
 	@cp $(TARGET_RELEASE) $(BIN_DIR)/
 
 	@echo "⚙️  Generating Systemd service..."
@@ -26,8 +27,9 @@ install: build
 	@sed "s|{{BIN_PATH}}|$(BIN_DIR)/$(BINARY_NAME)|g" qb-floccus.service.in > $(SYSTEMD_DIR)/qb-floccus.service
 	
 	@echo "✅ Installation complete!"
-	@echo "   Run: systemctl --user daemon-reload"
-	@echo "   Run: systemctl --user enable --now qb-floccus"
+	@echo "   Run:"
+	@echo "        systemctl --user daemon-reload"
+	@echo "        systemctl --user enable --now qb-floccus"
 
 clean:
 	cargo clean
