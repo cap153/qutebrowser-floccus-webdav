@@ -43,8 +43,6 @@ struct Bookmark {
     path: Vec<String>,
     #[serde(default)]
     order_id: u64,
-    #[serde(default)]
-    xbel_id: Option<u32>,
 }
 
 impl PartialEq for Bookmark {
@@ -205,25 +203,6 @@ fn sync_once(
         ));
     }
 
-    // 遍历远程和快照，找到最大的 xbel_id
-    let mut max_xbel_id = 0;
-    // 辅助闭包：更新最大值
-    let mut update_max = |map: &HashMap<String, Bookmark>| {
-        for b in map.values() {
-            if let Some(id) = b.xbel_id {
-                if id > max_xbel_id {
-                    max_xbel_id = id;
-                }
-            }
-        }
-    };
-    update_max(&remote_map);
-    update_max(&snapshot_map);
-    // 如果是全新的系统，从 100 开始避免冲突系统保留 ID (1-4)
-    if max_xbel_id < 100 {
-        max_xbel_id = 100;
-    }
-
     // 4. 合并逻辑
     let mut final_map = HashMap::new();
     let mut all_urls: HashSet<String> = HashSet::new();
@@ -276,34 +255,16 @@ fn sync_once(
             }
         }
 
-        // ID 分配与继承逻辑
         if let Some(mut bm) = chosen {
-            // A. 处理 Order ID (保持原逻辑)
-            let existing_order = in_remote
+            let existing = in_remote
                 .map(|b| b.order_id)
                 .or(in_snap.map(|b| b.order_id));
-            if let Some(old) = existing_order {
+            if let Some(old) = existing {
                 bm.order_id = old;
             } else {
                 max_order_id += 1;
                 bm.order_id = max_order_id;
             }
-
-            // B. 处理 XBEL ID (持久化核心)
-            // 尝试从远程或快照中获取已有的 ID
-            let existing_xbel_id = in_remote
-                .and_then(|b| b.xbel_id)
-                .or(in_snap.and_then(|b| b.xbel_id));
-
-            if let Some(uid) = existing_xbel_id {
-                // 如果以前有 ID，必须继承！
-                bm.xbel_id = Some(uid);
-            } else {
-                // 如果是全新的（本地新建的），分配新 ID
-                max_xbel_id += 1;
-                bm.xbel_id = Some(max_xbel_id);
-            }
-
             final_map.insert(url.to_string(), bm);
         }
     }
@@ -352,7 +313,6 @@ fn parse_xbel_stream(xml: &str) -> Result<HashMap<String, Bookmark>> {
     let mut global_counter: u64 = 0;
 
     let mut current_href: Option<String> = None;
-    let mut current_id: Option<u32> = None;
     let mut in_title = false;
 
     loop {
@@ -363,27 +323,17 @@ fn parse_xbel_stream(xml: &str) -> Result<HashMap<String, Bookmark>> {
                         path_stack.push("Untitled".to_string());
                     }
                     b"bookmark" => {
-                        // 临时变量存储 id
-                        let mut tmp_id: Option<u32> = None;
                         for attr in e.attributes() {
                             if let Ok(a) = attr {
-                                match a.key.as_ref() {
-                                    b"href" => {
-                                        let raw = String::from_utf8_lossy(&a.value).to_string();
-                                        let clean = html_decode(&raw);
-                                        current_href = Some(clean);
-                                    }
-                                    b"id" => {
-                                        let s = String::from_utf8_lossy(&a.value);
-                                        if let Ok(num) = s.parse::<u32>() {
-                                            tmp_id = Some(num);
-                                        }
-                                    }
-                                    _ => {}
+                                if a.key.as_ref() == b"href" {
+                                    // 获取原始字符串
+                                    let raw = String::from_utf8_lossy(&a.value).to_string();
+                                    // 🔥 强力清洗
+                                    let clean = html_decode(&raw);
+                                    current_href = Some(clean);
                                 }
                             }
                         }
-                        current_id = tmp_id;
                     }
                     b"title" => {
                         in_title = true;
@@ -410,7 +360,6 @@ fn parse_xbel_stream(xml: &str) -> Result<HashMap<String, Bookmark>> {
                                 title: txt,
                                 path: filtered_path,
                                 order_id: global_counter,
-                                xbel_id: current_id,
                             },
                         );
                     } else {
@@ -442,7 +391,6 @@ fn parse_xbel_stream(xml: &str) -> Result<HashMap<String, Bookmark>> {
                                     title: href,
                                     path: filtered_path,
                                     order_id: global_counter,
-                                    xbel_id: current_id,
                                 },
                             );
                         }
@@ -537,7 +485,6 @@ fn parse_qutebrowser_file(path: &PathBuf) -> Result<HashMap<String, Bookmark>> {
                     title,
                     path,
                     order_id: 0,
-                    xbel_id: None,
                 },
             );
         }
@@ -651,19 +598,10 @@ fn generate_xbel_content(map: &HashMap<String, Bookmark>) -> Result<String> {
         sorted.sort_by(|a, b| a.order_id.cmp(&b.order_id));
 
         for bm in sorted {
-            // 不再使用 id_gen 自增，而是使用持久化的 id
-            let final_id = bm.xbel_id.unwrap_or_else(|| {
-                // 兜底：理论上不该走到这，因为合并阶段都分配了。
-                // 如果真没有，临时生成一个
-                *id_gen += 1;
-                *id_gen as u32
-            });
-
+            *id_gen += 1;
             let mut bm_start = BytesStart::new("bookmark");
             bm_start.push_attribute(("href", bm.url.as_str()));
-            // 写入持久化的 ID
-            bm_start.push_attribute(("id", final_id.to_string().as_str()));
-
+            bm_start.push_attribute(("id", id_gen.to_string().as_str()));
             writer.write_event(Event::Start(bm_start))?;
 
             writer.write_event(Event::Start(BytesStart::new("title")))?;
