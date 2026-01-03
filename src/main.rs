@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Cursor};
 use std::path::PathBuf;
+use std::process::Command;
 use std::thread;
 use std::time::{Duration, SystemTime};
 
@@ -26,8 +27,10 @@ struct AppConfig {
 #[derive(Debug, Deserialize)]
 struct WebDavConfig {
     url: String,
-    username: String,
-    password: String,
+    username: Option<String>,
+    username_cmd: Option<String>,
+    password: Option<String>,
+    password_cmd: Option<String>,
 }
 
 const FOLDER_BAR: &str = "Bookmarks Bar";
@@ -49,6 +52,47 @@ impl PartialEq for Bookmark {
     fn eq(&self, other: &Self) -> bool {
         self.url == other.url && self.title == other.title && self.path == other.path
     }
+}
+
+// ==========================================
+// 辅助函数：凭证解析
+// ==========================================
+fn resolve_credential(
+    direct_value: &Option<String>,
+    cmd_value: &Option<String>,
+    field_name: &str,
+) -> Result<String> {
+    // 1. 优先使用配置文件里的明文
+    if let Some(v) = direct_value {
+        return Ok(v.clone());
+    }
+
+    // 2. 其次执行命令获取
+    if let Some(cmd) = cmd_value {
+        println!("🔑 Executing {} command resolve credential: {} ", field_name, cmd);
+        let output = if cfg!(target_os = "windows") {
+            Command::new("cmd").args(["/C", cmd]).output()?
+        } else {
+            Command::new("sh").args(["-c", cmd]).output()?
+        };
+
+        if !output.status.success() {
+            return Err(anyhow::anyhow!(
+                "Command for '{}' failed: {}",
+                field_name,
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        // 去除首尾空白符 (如换行)
+        return Ok(String::from_utf8(output.stdout)?.trim().to_string());
+    }
+
+    // 3. 都没有则报错
+    Err(anyhow::anyhow!(
+        "Missing '{}' or '{}_cmd' in config!",
+        field_name,
+        field_name
+    ))
 }
 
 // ==========================================
@@ -143,6 +187,19 @@ fn sync_once(
     qb_file_path: &PathBuf,
     snapshot_path: &PathBuf,
 ) -> Result<()> {
+    // 0. 解析凭证
+    let username = resolve_credential(
+        &config.webdav.username,
+        &config.webdav.username_cmd,
+        "username",
+    )?;
+
+    let password = resolve_credential(
+        &config.webdav.password,
+        &config.webdav.password_cmd,
+        "password",
+    )?;
+
     // 1. 读取本地
     println!("📂 Reading local: {:?}", qb_file_path);
     let local_map = parse_qutebrowser_file(qb_file_path).unwrap_or_default();
@@ -163,7 +220,7 @@ fn sync_once(
     let client = Client::new();
     let resp = client
         .get(target_url)
-        .basic_auth(&config.webdav.username, Some(&config.webdav.password))
+        .basic_auth(&username, Some(&password))
         .send()
         .context("WebDAV connect fail")?;
 
@@ -282,7 +339,7 @@ fn sync_once(
     }
     client
         .put(target_url)
-        .basic_auth(&config.webdav.username, Some(&config.webdav.password))
+        .basic_auth(&username, Some(&password))
         .body(xbel_content)
         .send()
         .context("Upload XBEL fail")?;

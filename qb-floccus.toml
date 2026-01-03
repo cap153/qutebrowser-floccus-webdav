@@ -1,0 +1,16 @@
+# 可以指定qutebrowser本地书签文件的路径，windows系统可以这样写
+# local_path = 'C:\Users\Captain\AppData\Roaming\qutebrowser\config\bookmarks\urls'
+
+# 时间间隔，单位是秒，没有设置的话运行1次退出
+interval = 900
+
+[webdav]
+# 直接写你的webdav服务器地址，例如 http://192.168.1.5:8080 也是可以的
+url = "http://192.168.1.5:8080/bookmarks.xbel"
+# 用户名：从环境变量获取 (Systemd 中设置 Environment="WEBDAV_USER=你的用户名" 其他命令只要能拿到用户名就行)
+username_cmd = "echo $WEBDAV_USER" 
+# 密码：从 gpg 加密的 pass 库获取 (读取纯文本文件 cat ~/.secret_dav 也是支持的，或者配合 GNOME Keyring 只要能拿到密码就行)
+password_cmd = "pass show network/webdav"
+# 如果不考虑安全问题也可以删除cmd直接在这里设置明文
+# username = "abc"
+# password = "123"
