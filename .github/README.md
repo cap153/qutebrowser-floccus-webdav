@@ -42,7 +42,7 @@ Before using this software, you must understand and accept the following risks:
 
 ## 📦 Installation
 
-### Method 1: Build from Source & Auto Deploy (Recommended)
+### Method 1: Build from Source & Auto Deploy
 
 Requires [Rust toolchain](https://rustup.rs/) installed. The Makefile will handle compilation, installation, and **Systemd service generation/registration**.
 

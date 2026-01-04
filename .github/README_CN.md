@@ -42,9 +42,9 @@
 
 ## 📦 安装
 
-### 方式一：源码编译 & 自动部署 (推荐)
+### 方式一：源码编译 & 自动部署
 
-如果您安装了 Rust 工具链，Makefile 会自动完成编译、安装以及 **Systemd 服务的生成与注册**。
+如果您安装了 [Rust 工具链](https://rustup.rs/)，Makefile 会自动完成编译、安装以及 **Systemd 服务的生成与注册**。
 
 ```bash
 git clone https://github.com/cap153/qb-floccus.git
