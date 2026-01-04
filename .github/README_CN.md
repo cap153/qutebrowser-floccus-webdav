@@ -150,4 +150,4 @@ qb-floccus --check-dupe
 
 ## License
 
-[MIT](LICENSE)
+[MIT](../LICENSE)
