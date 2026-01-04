@@ -18,7 +18,7 @@ build:
 install: build
 	@echo "📦 Installing binary to $(BIN_DIR)..."
 	@mkdir -p $(BIN_DIR)
-	@rm $(BIN_DIR)/qb-floccus
+	@rm -f $(BIN_DIR)/qb-floccus
 	@cp $(TARGET_RELEASE) $(BIN_DIR)/
 
 	@echo "⚙️  Generating Systemd service..."
