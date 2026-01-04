@@ -1,8 +1,8 @@
-
 # qb-floccus
 
 [![Rust](https://img.shields.io/badge/Language-Rust-orange.svg)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](#LICENSE)
+[English](README.md)  
 
 **qb-floccus** 是一个专为 **Qutebrowser** 编写的高性能双向书签同步工具。
 
@@ -150,4 +150,4 @@ qb-floccus --check-dupe
 
 ## License
 
-[MIT](#LICENSE)
+[MIT](LICENSE)
