@@ -47,7 +47,7 @@ Before using this software, you must understand and accept the following risks:
 Requires [Rust toolchain](https://rustup.rs/) installed. The Makefile will handle compilation, installation, and **Systemd service generation/registration**.
 
 ```bash
-git clone https://github.com/yourname/qb-floccus.git
+git clone https://github.com/cap153/qb-floccus.git
 cd qb-floccus
 
 # Compiles and installs to ~/.local/bin, and configures Systemd automatically

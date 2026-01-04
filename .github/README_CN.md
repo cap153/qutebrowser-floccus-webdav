@@ -47,7 +47,7 @@
 如果您安装了 Rust 工具链，Makefile 会自动完成编译、安装以及 **Systemd 服务的生成与注册**。
 
 ```bash
-git clone https://github.com/yourname/qb-floccus.git
+git clone https://github.com/cap153/qb-floccus.git
 cd qb-floccus
 
 # 编译并安装到 ~/.local/bin，同时自动配置 Systemd
