@@ -2,7 +2,7 @@
 
 [![Rust](https://img.shields.io/badge/Language-Rust-orange.svg)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](#LICENSE)
-[中文文档](README_ZH.md)
+[中文文档](README_CN.md)
 
 **qb-floccus** is a high-performance, bidirectional bookmark synchronization tool written specifically for **Qutebrowser**.
 
