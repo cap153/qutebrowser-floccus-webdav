@@ -60,7 +60,7 @@ systemctl --user enable --now qb-floccus
 
 ### Method 2: Download Binary (Manual Deployment)
 
-1.  Download the binary from [Releases](https://github.com/yourname/qb-floccus/releases) and place it in your PATH (e.g., `~/.local/bin/`).
+1.  Download the binary from [Releases](https://github.com/cap153/qb-floccus/releases) and place it in your PATH (e.g., `~/.local/bin/`).
 2.  **Manually configure Systemd** (as follows):
 
 Create file `~/.config/systemd/user/qb-floccus.service`:

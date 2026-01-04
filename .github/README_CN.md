@@ -60,7 +60,7 @@ systemctl --user enable --now qb-floccus
 
 ### 方式二：下载二进制文件 (手动部署)
 
-1.  从 [Releases](https://github.com/yourname/qb-floccus/releases) 下载二进制文件并放入 PATH（如 `~/.local/bin/`）。
+1.  从 [Releases](https://github.com/cap153/qb-floccus/releases) 下载二进制文件并放入 PATH（如 `~/.local/bin/`）。
 2.  **手动配置 Systemd**（如下）：
 
 创建文件 `~/.config/systemd/user/qb-floccus.service`：
