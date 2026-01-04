@@ -158,4 +158,4 @@ The code logic of this project is designed to be fully compatible with Windows (
 
 ## License
 
-[MIT](LICENSE)
+[MIT](../LICENSE)
