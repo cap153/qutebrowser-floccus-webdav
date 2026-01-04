@@ -7,7 +7,6 @@ Type=simple
 ExecStart={{BIN_PATH}}
 Restart=on-failure
 RestartSec=60s
-Environment="WEBDAV_USER=secadm"
 
 [Install]
 WantedBy=default.target

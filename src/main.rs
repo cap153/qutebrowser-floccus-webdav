@@ -6,6 +6,7 @@ use reqwest::blocking::Client;
 use reqwest::header::LAST_MODIFIED;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::env;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Cursor};
 use std::path::PathBuf;
@@ -62,14 +63,14 @@ fn resolve_credential(
     cmd_value: &Option<String>,
     field_name: &str,
 ) -> Result<String> {
-    // 1. 优先使用配置文件里的明文
-    if let Some(v) = direct_value {
-        return Ok(v.clone());
-    }
-
-    // 2. 其次执行命令获取
-    if let Some(cmd) = cmd_value {
-        println!("🔑 Executing {} command resolve credential: {} ", field_name, cmd);
+    // 1. 尝试获取值
+    let credential = if let Some(v) = direct_value {
+        // 从配置文件直接读取
+        v.clone()
+    } else if let Some(cmd) = cmd_value {
+        // 从命令执行获取
+        // println!("🔑 Resolving {} via command: {}", field_name, cmd);
+        
         let output = if cfg!(target_os = "windows") {
             Command::new("cmd").args(["/C", cmd]).output()?
         } else {
@@ -77,22 +78,91 @@ fn resolve_credential(
         };
 
         if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(anyhow::anyhow!(
-                "Command for '{}' failed: {}",
+                "Command for '{}' failed with exit code {:?}.\nError output: {}",
                 field_name,
-                String::from_utf8_lossy(&output.stderr)
+                output.status.code(),
+                stderr.trim()
             ));
         }
-        // 去除首尾空白符 (如换行)
-        return Ok(String::from_utf8(output.stdout)?.trim().to_string());
+        
+        String::from_utf8(output.stdout)?.trim().to_string()
+    } else {
+        return Err(anyhow::anyhow!(
+            "Configuration error: Missing '{}' or '{}_cmd' in config.",
+            field_name,
+            field_name
+        ));
+    };
+
+    // 2. 核心安全检查：禁止空凭证
+    if credential.is_empty() {
+        return Err(anyhow::anyhow!(
+            "CRITICAL: Resolved '{}' is EMPTY! WebDAV requires a value.\n\
+             (If using a command like 'echo $VAR', ensure the environment variable is actually set)",
+            field_name
+        ));
     }
 
-    // 3. 都没有则报错
-    Err(anyhow::anyhow!(
-        "Missing '{}' or '{}_cmd' in config!",
-        field_name,
-        field_name
-    ))
+    Ok(credential)
+}
+
+// ==========================================
+// 辅助函数：获取远程 XML (含凭证返回)
+// ==========================================
+fn fetch_remote_xml(
+    config: &AppConfig,
+    target_url: &str,
+) -> Result<(String, SystemTime, String, String)> {
+    let username = resolve_credential(
+        &config.webdav.username,
+        &config.webdav.username_cmd,
+        "username",
+    )?;
+    let password = resolve_credential(
+        &config.webdav.password,
+        &config.webdav.password_cmd,
+        "password",
+    )?;
+
+    println!("☁️  Fetching remote: {}", target_url);
+    let client = Client::new();
+    let resp = client
+        .get(target_url)
+        .basic_auth(&username, Some(&password))
+        .send()
+        .context("WebDAV connect fail")?;
+
+    let status = resp.status();
+    let last_modified = resp
+        .headers()
+        .get(LAST_MODIFIED)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| httpdate::parse_http_date(s).ok())
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+
+    // 🚑 修复：严格检查文件是否存在
+    let content = if status.is_success() {
+        // 2xx (通常是 200) -> 成功
+        resp.text()?
+    } else if status == reqwest::StatusCode::NOT_FOUND {
+        // 404 -> 报错停止 (不自动创建)
+        return Err(anyhow::anyhow!(
+            "CRITICAL: Remote file not found (404) at: {}\n\
+             Please manually create the 'bookmarks.xbel' file on your WebDAV server first (even if empty),\n\
+             or check if the URL in config is correct.", 
+            target_url
+        ));
+    } else {
+        // 401/403/500 等 -> 报错停止
+        return Err(anyhow::anyhow!(
+            "CRITICAL: Remote fetch failed with status: {}. Aborting.",
+            status
+        ));
+    };
+
+    Ok((content, last_modified, username, password))
 }
 
 // ==========================================
@@ -100,10 +170,18 @@ fn resolve_credential(
 // ==========================================
 
 fn main() -> Result<()> {
-    // 1. 基础环境准备
-    let home = dirs::home_dir().context("No home dir")?;
+    // 0. 解析参数
+    let args: Vec<String> = env::args().collect();
+    let is_check_mode = args.contains(&"--check-dupe".to_string());
 
-    // Qutebrowser 配置目录
+    if is_check_mode {
+        println!("🔍 Starting Duplicate Check Mode...");
+    } else {
+        println!("🚀 Starting qb-floccus");
+    }
+
+    // 1. 基础环境
+    let home = dirs::home_dir().context("No home dir")?;
     let qb_config_dir = if cfg!(target_os = "windows") {
         home.join("AppData").join("Roaming").join("qutebrowser")
     } else {
@@ -113,25 +191,18 @@ fn main() -> Result<()> {
     // 2. 加载配置
     let config_file = qb_config_dir.join("qb-floccus.toml");
     if !config_file.exists() {
-        return Err(anyhow::anyhow!(
-            "Config file not found!\nPlease create: {:?}\n\nExample content:\n[webdav]\nurl = '...'\nusername = '...'\npassword = '...'",
-            config_file
-        ));
+        return Err(anyhow::anyhow!("Config file not found: {:?}", config_file));
     }
-
-    println!("⚙️  Loading config: {:?}", config_file);
     let config_content = fs::read_to_string(&config_file)?;
     let config: AppConfig = toml::from_str(&config_content)?;
 
-    // 3. 计算关键路径
-    // 本地书签路径
+    // 3. 计算路径
     let qb_file_path = if let Some(p) = &config.local_path {
         PathBuf::from(p)
     } else {
         qb_config_dir.join("bookmarks").join("urls")
     };
 
-    // 快照路径 (XDG Cache)
     let cache_dir = if cfg!(target_os = "windows") {
         home.join("AppData").join("Local").join("qb-floccus")
     } else {
@@ -142,7 +213,7 @@ fn main() -> Result<()> {
     }
     let snapshot_path = cache_dir.join("snapshot.json");
 
-    // 4. URL 标准化预处理
+    // 4. URL 预处理
     let raw_url = config.webdav.url.trim();
     let target_url = if raw_url.to_lowercase().ends_with(".xbel") {
         raw_url.to_string()
@@ -151,25 +222,55 @@ fn main() -> Result<()> {
         format!("{}/bookmarks.xbel", base)
     };
 
-    // 5. 调度逻辑 (单次运行 或 守护进程)
+    // =========================================================
+    // 分支 1：查重模式
+    // =========================================================
+    if is_check_mode {
+        println!("\n=== [1/2] Checking Local Bookmarks ===");
+        if let Err(e) = check_local_duplicates(&qb_file_path) {
+            println!("⚠️  Local check error: {}", e);
+        }
+
+        println!("\n=== [2/2] Checking Remote WebDAV Bookmarks ===");
+        match fetch_remote_xml(&config, &target_url) {
+            Ok((xml, _, _, _)) => check_remote_duplicates(&xml)?,
+            Err(e) => {
+                // 查重模式下，任何错误都直接退出
+                eprintln!("❌ Failed to fetch remote: {}", e);
+                std::process::exit(1); 
+            },
+        }
+        return Ok(());
+    }
+
+    // =========================================================
+    // 分支 2：同步模式
+    // =========================================================
     match config.interval {
         Some(secs) if secs > 0 => {
-            println!(
-                "🚀 Starting qb-floccus in DAEMON mode (Interval: {}s)...",
-                secs
-            );
+            println!("🚀 Starting Daemon Mode (Interval: {}s)...", secs);
             loop {
-                // 在循环中捕获错误，防止单次网络波动导致进程崩溃退出
                 match sync_once(&config, &target_url, &qb_file_path, &snapshot_path) {
-                    Ok(_) => println!("✅ Sync cycle finished. Sleeping for {}s...", secs),
-                    Err(e) => eprintln!("❌ Sync failed: {:#?}\n   Retrying in {}s...", e, secs),
+                    Ok(_) => println!("✅ Sync finished. Sleeping {}s...", secs),
+                    Err(e) => {
+                        // 🌟 核心修复：智能错误判断
+                        let err_msg = e.to_string();
+                        
+                        // 如果错误信息包含 "CRITICAL"，说明是配置或文件缺失等不可恢复错误
+                        if err_msg.contains("CRITICAL") {
+                            eprintln!("❌ FATAL ERROR: {}\n🛑 Daemon stopped due to configuration or file error.", err_msg);
+                            std::process::exit(1); // 立即退出，不再重试
+                        } else {
+                            // 其他错误（如网络超时、DNS解析失败）视为临时错误，可以重试
+                            eprintln!("⚠️  Transient Error: {:#?}\n🔄 Retrying in {}s...", e, secs);
+                        }
+                    },
                 }
                 thread::sleep(Duration::from_secs(secs));
             }
         }
         _ => {
-            println!("🚀 Starting qb-floccus (Run-Once mode)...");
-            // 单次模式直接抛出错误
+            println!("🚀 Starting Run-Once Mode...");
             sync_once(&config, &target_url, &qb_file_path, &snapshot_path)?;
         }
     }
@@ -187,19 +288,6 @@ fn sync_once(
     qb_file_path: &PathBuf,
     snapshot_path: &PathBuf,
 ) -> Result<()> {
-    // 0. 解析凭证
-    let username = resolve_credential(
-        &config.webdav.username,
-        &config.webdav.username_cmd,
-        "username",
-    )?;
-
-    let password = resolve_credential(
-        &config.webdav.password,
-        &config.webdav.password_cmd,
-        "password",
-    )?;
-
     // 1. 读取本地
     println!("📂 Reading local: {:?}", qb_file_path);
     let local_map = parse_qutebrowser_file(qb_file_path).unwrap_or_default();
@@ -215,29 +303,10 @@ fn sync_once(
         HashMap::new()
     };
 
-    // 3. 读取远程
-    println!("☁️  Fetching remote: {}", target_url);
-    let client = Client::new();
-    let resp = client
-        .get(target_url)
-        .basic_auth(&username, Some(&password))
-        .send()
-        .context("WebDAV connect fail")?;
-
-    let status = resp.status();
-    let remote_last_modified = resp
-        .headers()
-        .get(LAST_MODIFIED)
-        .and_then(|h| h.to_str().ok())
-        .and_then(|s| httpdate::parse_http_date(s).ok())
-        .unwrap_or(SystemTime::UNIX_EPOCH);
-
-    let remote_xml = if status.is_success() {
-        resp.text()?
-    } else {
-        println!("   ⚠️ Remote status {}, assuming empty.", status);
-        String::new()
-    };
+    // 3. 读取远程 (🌟 获取 XML 和 凭证)
+    // 这里的 username 和 password 是刚才 fetch 时解析出来的，直接复用
+    let (remote_xml, remote_last_modified, username, password) =
+        fetch_remote_xml(config, target_url)?;
 
     // 解析远程
     let remote_map = parse_xbel_stream(&remote_xml)?;
@@ -250,11 +319,7 @@ fn sync_once(
     );
 
     // 熔断保护
-    if status.is_success()
-        && !remote_xml.is_empty()
-        && remote_map.is_empty()
-        && !snapshot_map.is_empty()
-    {
+    if !remote_xml.is_empty() && remote_map.is_empty() && !snapshot_map.is_empty() {
         return Err(anyhow::anyhow!(
             "CRITICAL: Remote parsed 0 bookmarks! Logic error."
         ));
@@ -337,9 +402,9 @@ fn sync_once(
     if xbel_content.len() < 100 && final_map.len() > 2 {
         return Err(anyhow::anyhow!("Generated XBEL too small."));
     }
-    client
+    Client::new()
         .put(target_url)
-        .basic_auth(&username, Some(&password))
+        .basic_auth(username, Some(password))
         .body(xbel_content)
         .send()
         .context("Upload XBEL fail")?;
@@ -352,7 +417,134 @@ fn sync_once(
 }
 
 // ==========================================
-// 新版解析器 (Quick-XML Stream)
+// 查重逻辑
+// ==========================================
+
+fn check_local_duplicates(path: &PathBuf) -> Result<()> {
+    if !path.exists() {
+        return Err(anyhow::anyhow!("Local bookmarks file not found: {:?}", path));
+    }
+    
+    let reader = BufReader::new(File::open(path)?);
+    let mut tracker: HashMap<String, Vec<(String, usize)>> = HashMap::new();
+
+    for (idx, line) in reader.lines().enumerate() {
+        let line = line?;
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some((url, _)) = line.split_once(' ') {
+            tracker
+                .entry(url.to_string())
+                .or_default()
+                .push((line.to_string(), idx + 1));
+        }
+    }
+
+    let mut found = false;
+    for (url, entries) in tracker {
+        if entries.len() > 1 {
+            found = true;
+            println!("⚠️  Duplicate: {}", url);
+            for (_, num) in entries {
+                println!("   Line {}", num);
+            }
+        }
+    }
+    if !found {
+        println!("✅ No local duplicates.");
+    }
+    Ok(())
+}
+
+fn check_remote_duplicates(xml: &str) -> Result<()> {
+    if xml.trim().is_empty() {
+        return Ok(());
+    }
+
+    let mut reader = Reader::from_str(xml);
+    reader.trim_text(true);
+    reader.expand_empty_elements(true);
+
+    let mut buf = Vec::new();
+    let mut path_stack: Vec<String> = Vec::new();
+    let mut tracker: HashMap<String, Vec<String>> = HashMap::new();
+
+    let mut current_href: Option<String> = None;
+    let mut in_title = false;
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => match e.name().as_ref() {
+                b"folder" => path_stack.push("Untitled".to_string()),
+                b"bookmark" => {
+                    for attr in e.attributes().flatten() {
+                        if attr.key.as_ref() == b"href" {
+                            let raw = String::from_utf8_lossy(&attr.value).to_string();
+                            current_href = Some(html_decode(&raw));
+                        }
+                    }
+                }
+                b"title" => in_title = true,
+                _ => {}
+            },
+            Ok(Event::Text(e)) => {
+                if in_title {
+                    let txt = e.unescape()?.to_string();
+                    if current_href.is_none() {
+                        if let Some(last) = path_stack.last_mut() {
+                            *last = txt;
+                        }
+                    }
+                }
+            }
+            Ok(Event::End(e)) => match e.name().as_ref() {
+                b"folder" => {
+                    path_stack.pop();
+                }
+                b"bookmark" => {
+                    if let Some(href) = current_href.take() {
+                        let location = if path_stack.is_empty() {
+                            "Root".to_string()
+                        } else {
+                            path_stack.join(" > ")
+                        };
+                        tracker.entry(href).or_default().push(location);
+                    }
+                }
+                b"title" => in_title = false,
+                _ => {}
+            },
+            Ok(Event::Eof) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    let mut found = false;
+    for (url, paths) in tracker {
+        if paths.len() > 1 {
+            found = true;
+            println!("---------------------------------------------------");
+            println!("⚠️  Duplicate Found (x{}): {}", paths.len(), url);
+            for (i, p) in paths.iter().enumerate() {
+                println!("   {}. {}", i + 1, p);
+            }
+        }
+    }
+
+    if found {
+        println!("---------------------------------------------------");
+        println!("❗ WARNING: Syncing now will keep ONLY the LAST occurrence.");
+    } else {
+        println!("✅ No remote duplicates.");
+    }
+    Ok(())
+}
+
+// ==========================================
+// 解析器与生成器 (保持不变)
 // ==========================================
 
 fn parse_xbel_stream(xml: &str) -> Result<HashMap<String, Bookmark>> {
@@ -467,52 +659,42 @@ fn parse_xbel_stream(xml: &str) -> Result<HashMap<String, Bookmark>> {
 }
 
 fn html_decode(s: &str) -> String {
-    // 1. 快速通道：如果没有 '&'，说明完全无需处理，直接返回
     if !s.contains('&') {
         return s.to_string();
     }
-
     let mut current = s.to_string();
-
-    // 安全计数器：防止极其罕见的恶意构造（可选，但在生产环境建议保留）
     let mut limit = 0;
-
     loop {
-        // 2. 预检查：如果这一轮连 '&' 都没了，肯定干净了
         if !current.contains('&') {
             break;
         }
-
-        // 3. 执行替换
         let next = current
             .replace("&amp;", "&")
             .replace("&lt;", "<")
             .replace("&gt;", ">")
             .replace("&quot;", "\"")
             .replace("&apos;", "'");
-
-        // 4. 核心退出条件：如果替换了一轮，内容没变，说明已经是最简形式（Raw URL）
-        // 即使它里面还有 '&' (比如参数分隔符)，也应该停止了
         if next == current {
             break;
         }
-
         current = next;
-
-        // 防止意外死循环保底 (比如某种特殊编码攻击)
         limit += 1;
         if limit > 10 {
             break;
         }
     }
-
     current
 }
 
 fn parse_qutebrowser_file(path: &PathBuf) -> Result<HashMap<String, Bookmark>> {
     if !path.exists() {
-        return Ok(HashMap::new());
+        return Err(anyhow::anyhow!(
+            "CRITICAL: Local bookmarks file not found at: {:?}\n\
+             Please check your 'local_path' config or manually create the file.", 
+            path
+        ));
     }
+
     let reader = BufReader::new(File::open(path)?);
     let mut map = HashMap::new();
 
@@ -548,10 +730,6 @@ fn parse_qutebrowser_file(path: &PathBuf) -> Result<HashMap<String, Bookmark>> {
     }
     Ok(map)
 }
-
-// ==========================================
-// 生成器 (Generators)
-// ==========================================
 
 fn generate_sorted_qutebrowser_content(map: &HashMap<String, Bookmark>) -> String {
     let mut list: Vec<&Bookmark> = map.values().collect();
