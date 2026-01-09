@@ -1,21 +1,19 @@
 use anyhow::{Context, Result};
-use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
-use quick_xml::reader::Reader;
-use quick_xml::writer::Writer;
 use reqwest::blocking::Client;
 use reqwest::header::LAST_MODIFIED;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Cursor};
+use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::Command;
 use std::thread;
 use std::time::{Duration, SystemTime};
+use xmltree::{Element, EmitterConfig, XMLNode};
 
 // ==========================================
-// 配置与常量
+// 配置与结构体
 // ==========================================
 
 #[derive(Debug, Deserialize)]
@@ -34,630 +32,80 @@ struct WebDavConfig {
     password_cmd: Option<String>,
 }
 
+const SEPARATOR: &str = " 📂 ";
 const FOLDER_BAR: &str = "Bookmarks Bar";
-const FOLDER_OTHER: &str = "Other Bookmarks";
 const FOLDER_MENU: &str = "Bookmarks Menu";
 const FOLDER_MOBILE: &str = "Mobile Bookmarks";
-const SEPARATOR: &str = " 📂 ";
+const FOLDER_OTHER: &str = "Other Bookmarks";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct Bookmark {
     url: String,
     title: String,
     path: Vec<String>,
-    #[serde(default)]
-    order_id: u64,
-}
-
-impl PartialEq for Bookmark {
-    fn eq(&self, other: &Self) -> bool {
-        self.url == other.url && self.title == other.title && self.path == other.path
-    }
 }
 
 // ==========================================
-// 辅助函数：凭证解析
-// ==========================================
-fn resolve_credential(
-    direct_value: &Option<String>,
-    cmd_value: &Option<String>,
-    field_name: &str,
-) -> Result<String> {
-    // 1. 尝试获取值
-    let credential = if let Some(v) = direct_value {
-        // 从配置文件直接读取
-        v.clone()
-    } else if let Some(cmd) = cmd_value {
-        // 从命令执行获取
-        // println!("🔑 Resolving {} via command: {}", field_name, cmd);
-        
-        let output = if cfg!(target_os = "windows") {
-            Command::new("cmd").args(["/C", cmd]).output()?
-        } else {
-            Command::new("sh").args(["-c", cmd]).output()?
-        };
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(anyhow::anyhow!(
-                "Command for '{}' failed with exit code {:?}.\nError output: {}",
-                field_name,
-                output.status.code(),
-                stderr.trim()
-            ));
-        }
-        
-        String::from_utf8(output.stdout)?.trim().to_string()
-    } else {
-        return Err(anyhow::anyhow!(
-            "Configuration error: Missing '{}' or '{}_cmd' in config.",
-            field_name,
-            field_name
-        ));
-    };
-
-    // 2. 核心安全检查：禁止空凭证
-    if credential.is_empty() {
-        return Err(anyhow::anyhow!(
-            "CRITICAL: Resolved '{}' is EMPTY! WebDAV requires a value.\n\
-             (If using a command like 'echo $VAR', ensure the environment variable is actually set)",
-            field_name
-        ));
-    }
-
-    Ok(credential)
-}
-
-// ==========================================
-// 辅助函数：获取远程 XML (含凭证返回)
-// ==========================================
-fn fetch_remote_xml(
-    config: &AppConfig,
-    target_url: &str,
-) -> Result<(String, SystemTime, String, String)> {
-    let username = resolve_credential(
-        &config.webdav.username,
-        &config.webdav.username_cmd,
-        "username",
-    )?;
-    let password = resolve_credential(
-        &config.webdav.password,
-        &config.webdav.password_cmd,
-        "password",
-    )?;
-
-    println!("☁️  Fetching remote: {}", target_url);
-    let client = Client::new();
-    let resp = client
-        .get(target_url)
-        .basic_auth(&username, Some(&password))
-        .send()
-        .context("WebDAV connect fail")?;
-
-    let status = resp.status();
-    let last_modified = resp
-        .headers()
-        .get(LAST_MODIFIED)
-        .and_then(|h| h.to_str().ok())
-        .and_then(|s| httpdate::parse_http_date(s).ok())
-        .unwrap_or(SystemTime::UNIX_EPOCH);
-
-    // 🚑 修复：严格检查文件是否存在
-    let content = if status.is_success() {
-        // 2xx (通常是 200) -> 成功
-        resp.text()?
-    } else if status == reqwest::StatusCode::NOT_FOUND {
-        // 404 -> 报错停止 (不自动创建)
-        return Err(anyhow::anyhow!(
-            "CRITICAL: Remote file not found (404) at: {}\n\
-             Please manually create the 'bookmarks.xbel' file on your WebDAV server first (even if empty),\n\
-             or check if the URL in config is correct.", 
-            target_url
-        ));
-    } else {
-        // 401/403/500 等 -> 报错停止
-        return Err(anyhow::anyhow!(
-            "CRITICAL: Remote fetch failed with status: {}. Aborting.",
-            status
-        ));
-    };
-
-    Ok((content, last_modified, username, password))
-}
-
-// ==========================================
-// 主流程
+// 辅助工具
 // ==========================================
 
-fn main() -> Result<()> {
-    // 0. 解析参数
-    let args: Vec<String> = env::args().collect();
-    let is_check_mode = args.contains(&"--check-dupe".to_string());
-
-    if is_check_mode {
-        println!("🔍 Starting Duplicate Check Mode...");
+// 处理 WebDAV URL，自动补全 .xbel
+fn get_target_url(raw_url: &str) -> String {
+    let trimmed = raw_url.trim();
+    if trimmed.to_lowercase().ends_with(".xbel") {
+        trimmed.to_string()
     } else {
-        println!("🚀 Starting qb-floccus");
-    }
-
-    // 1. 基础环境
-    let home = dirs::home_dir().context("No home dir")?;
-    let qb_config_dir = if cfg!(target_os = "windows") {
-        home.join("AppData").join("Roaming").join("qutebrowser")
-    } else {
-        home.join(".config").join("qutebrowser")
-    };
-
-    // 2. 加载配置
-    let config_file = qb_config_dir.join("qb-floccus.toml");
-    if !config_file.exists() {
-        return Err(anyhow::anyhow!("Config file not found: {:?}", config_file));
-    }
-    let config_content = fs::read_to_string(&config_file)?;
-    let config: AppConfig = toml::from_str(&config_content)?;
-
-    // 3. 计算路径
-    let qb_file_path = if let Some(p) = &config.local_path {
-        PathBuf::from(p)
-    } else {
-        qb_config_dir.join("bookmarks").join("urls")
-    };
-
-    let cache_dir = if cfg!(target_os = "windows") {
-        home.join("AppData").join("Local").join("qb-floccus")
-    } else {
-        home.join(".cache").join("qb-floccus")
-    };
-    if !cache_dir.exists() {
-        fs::create_dir_all(&cache_dir)?;
-    }
-    let snapshot_path = cache_dir.join("snapshot.json");
-
-    // 4. URL 预处理
-    let raw_url = config.webdav.url.trim();
-    let target_url = if raw_url.to_lowercase().ends_with(".xbel") {
-        raw_url.to_string()
-    } else {
-        let base = raw_url.trim_end_matches('/');
+        let base = trimmed.trim_end_matches('/');
         format!("{}/bookmarks.xbel", base)
-    };
-
-    // =========================================================
-    // 分支 1：查重模式
-    // =========================================================
-    if is_check_mode {
-        println!("\n=== [1/2] Checking Local Bookmarks ===");
-        if let Err(e) = check_local_duplicates(&qb_file_path) {
-            println!("⚠️  Local check error: {}", e);
-        }
-
-        println!("\n=== [2/2] Checking Remote WebDAV Bookmarks ===");
-        match fetch_remote_xml(&config, &target_url) {
-            Ok((xml, _, _, _)) => check_remote_duplicates(&xml)?,
-            Err(e) => {
-                // 查重模式下，任何错误都直接退出
-                eprintln!("❌ Failed to fetch remote: {}", e);
-                std::process::exit(1); 
-            },
-        }
-        return Ok(());
     }
-
-    // =========================================================
-    // 分支 2：同步模式
-    // =========================================================
-    match config.interval {
-        Some(secs) if secs > 0 => {
-            println!("🚀 Starting Daemon Mode (Interval: {}s)...", secs);
-            loop {
-                match sync_once(&config, &target_url, &qb_file_path, &snapshot_path) {
-                    Ok(_) => println!("✅ Sync finished. Sleeping {}s...", secs),
-                    Err(e) => {
-                        // 🌟 核心修复：智能错误判断
-                        let err_msg = e.to_string();
-                        
-                        // 如果错误信息包含 "CRITICAL"，说明是配置或文件缺失等不可恢复错误
-                        if err_msg.contains("CRITICAL") {
-                            eprintln!("❌ FATAL ERROR: {}\n🛑 Daemon stopped due to configuration or file error.", err_msg);
-                            std::process::exit(1); // 立即退出，不再重试
-                        } else {
-                            // 其他错误（如网络超时、DNS解析失败）视为临时错误，可以重试
-                            eprintln!("⚠️  Transient Error: {:#?}\n🔄 Retrying in {}s...", e, secs);
-                        }
-                    },
-                }
-                thread::sleep(Duration::from_secs(secs));
-            }
-        }
-        _ => {
-            println!("🚀 Starting Run-Once Mode...");
-            sync_once(&config, &target_url, &qb_file_path, &snapshot_path)?;
-        }
-    }
-
-    Ok(())
 }
 
 // ==========================================
-// 核心同步逻辑 (Sync Once)
+// 1. 解析逻辑 (Reader)
 // ==========================================
 
-fn sync_once(
-    config: &AppConfig,
-    target_url: &str,
-    qb_file_path: &PathBuf,
-    snapshot_path: &PathBuf,
-) -> Result<()> {
-    // 1. 读取本地
-    println!("📂 Reading local: {:?}", qb_file_path);
-    let local_map = parse_qutebrowser_file(qb_file_path).unwrap_or_default();
-    let local_mtime = fs::metadata(qb_file_path)
-        .and_then(|m| m.modified())
-        .unwrap_or(SystemTime::UNIX_EPOCH);
-
-    // 2. 读取快照
-    let snapshot_map: HashMap<String, Bookmark> = if snapshot_path.exists() {
-        let f = File::open(snapshot_path)?;
-        serde_json::from_reader(BufReader::new(f)).unwrap_or_default()
-    } else {
-        HashMap::new()
-    };
-
-    // 3. 读取远程 (🌟 获取 XML 和 凭证)
-    // 这里的 username 和 password 是刚才 fetch 时解析出来的，直接复用
-    let (remote_xml, remote_last_modified, username, password) =
-        fetch_remote_xml(config, target_url)?;
-
-    // 解析远程
-    let remote_map = parse_xbel_stream(&remote_xml)?;
-
-    println!(
-        "📊 Stats: Local={}, Remote={}, Snapshot={}",
-        local_map.len(),
-        remote_map.len(),
-        snapshot_map.len()
-    );
-
-    // 熔断保护
-    if !remote_xml.is_empty() && remote_map.is_empty() && !snapshot_map.is_empty() {
-        return Err(anyhow::anyhow!(
-            "CRITICAL: Remote parsed 0 bookmarks! Logic error."
-        ));
-    }
-
-    // 4. 合并逻辑
-    let mut final_map = HashMap::new();
-    let mut all_urls: HashSet<String> = HashSet::new();
-    all_urls.extend(local_map.keys().cloned());
-    all_urls.extend(remote_map.keys().cloned());
-    all_urls.extend(snapshot_map.keys().cloned());
-
-    let local_is_newer = local_mtime >= remote_last_modified;
-    let first_run = snapshot_map.is_empty();
-    let mut max_order_id = remote_map.values().map(|b| b.order_id).max().unwrap_or(0);
-
-    for url in all_urls {
-        let in_local = local_map.get(&url);
-        let in_remote = remote_map.get(&url);
-        let in_snap = snapshot_map.get(&url);
-
-        let mut chosen: Option<Bookmark> = None;
-
-        if first_run {
-            if let Some(l) = in_local {
-                chosen = Some(l.clone());
-            } else if let Some(r) = in_remote {
-                chosen = Some(r.clone());
-            }
-        } else {
-            match (in_local, in_remote, in_snap) {
-                (Some(l), Some(r), Some(s)) if l == r && r == s => {
-                    chosen = Some(l.clone());
-                }
-                (Some(l), Some(r), _) => {
-                    chosen = Some(if l != r && local_is_newer {
-                        l.clone()
-                    } else {
-                        r.clone()
-                    });
-                }
-                (Some(l), None, None) => {
-                    chosen = Some(l.clone());
-                }
-                (None, Some(r), None) => {
-                    chosen = Some(r.clone());
-                }
-                (None, Some(_), Some(_)) => {
-                    println!("   🗑️ Del Remote: {}", url);
-                }
-                (Some(_), None, Some(_)) => {
-                    println!("   🗑️ Del Local: {}", url);
-                }
-                _ => {}
-            }
-        }
-
-        if let Some(mut bm) = chosen {
-            let existing = in_remote
-                .map(|b| b.order_id)
-                .or(in_snap.map(|b| b.order_id));
-            if let Some(old) = existing {
-                bm.order_id = old;
-            } else {
-                max_order_id += 1;
-                bm.order_id = max_order_id;
-            }
-            final_map.insert(url.to_string(), bm);
-        }
-    }
-
-    println!("✨ Final count: {}", final_map.len());
-
-    // 5. 写入本地
-    let qb_content = generate_sorted_qutebrowser_content(&final_map);
-    fs::write(qb_file_path, qb_content).context("Write local fail")?;
-
-    // 6. 写入远程
-    let xbel_content = generate_xbel_content(&final_map)?;
-    if xbel_content.len() < 100 && final_map.len() > 2 {
-        return Err(anyhow::anyhow!("Generated XBEL too small."));
-    }
-    Client::new()
-        .put(target_url)
-        .basic_auth(username, Some(password))
-        .body(xbel_content)
-        .send()
-        .context("Upload XBEL fail")?;
-
-    // 7. 更新快照
-    let f = File::create(snapshot_path)?;
-    serde_json::to_writer(f, &final_map)?;
-
-    Ok(())
-}
-
-// ==========================================
-// 查重逻辑
-// ==========================================
-
-fn check_local_duplicates(path: &PathBuf) -> Result<()> {
+// 解析 Qutebrowser 本地文件
+fn parse_local_file(path: &PathBuf) -> Result<HashMap<String, Bookmark>> {
     if !path.exists() {
-        return Err(anyhow::anyhow!("Local bookmarks file not found: {:?}", path));
+        return Ok(HashMap::new());
     }
-    
     let reader = BufReader::new(File::open(path)?);
-    let mut tracker: HashMap<String, Vec<(String, usize)>> = HashMap::new();
+    let mut map = HashMap::new();
 
-    for (idx, line) in reader.lines().enumerate() {
+    for line in reader.lines() {
         let line = line?;
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
-        if let Some((url, _)) = line.split_once(' ') {
-            tracker
-                .entry(url.to_string())
-                .or_default()
-                .push((line.to_string(), idx + 1));
+
+        if let Some((url, raw_rest)) = line.split_once(' ') {
+            let parts: Vec<&str> = raw_rest.split(SEPARATOR).collect();
+            let (path_vec, title) = if parts.len() > 1 {
+                let t = parts.last().unwrap().to_string();
+                let p = parts[0..parts.len() - 1]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect();
+                (p, t)
+            } else {
+                (vec![], raw_rest.to_string())
+            };
+
+            map.insert(
+                url.to_string(),
+                Bookmark {
+                    url: url.to_string(),
+                    title,
+                    path: path_vec,
+                },
+            );
         }
-    }
-
-    let mut found = false;
-    for (url, entries) in tracker {
-        if entries.len() > 1 {
-            found = true;
-            println!("⚠️  Duplicate: {}", url);
-            for (_, num) in entries {
-                println!("   Line {}", num);
-            }
-        }
-    }
-    if !found {
-        println!("✅ No local duplicates.");
-    }
-    Ok(())
-}
-
-fn check_remote_duplicates(xml: &str) -> Result<()> {
-    if xml.trim().is_empty() {
-        return Ok(());
-    }
-
-    let mut reader = Reader::from_str(xml);
-    reader.trim_text(true);
-    reader.expand_empty_elements(true);
-
-    let mut buf = Vec::new();
-    let mut path_stack: Vec<String> = Vec::new();
-    let mut tracker: HashMap<String, Vec<String>> = HashMap::new();
-
-    let mut current_href: Option<String> = None;
-    let mut in_title = false;
-
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => match e.name().as_ref() {
-                b"folder" => path_stack.push("Untitled".to_string()),
-                b"bookmark" => {
-                    for attr in e.attributes().flatten() {
-                        if attr.key.as_ref() == b"href" {
-                            let raw = String::from_utf8_lossy(&attr.value).to_string();
-                            current_href = Some(html_decode(&raw));
-                        }
-                    }
-                }
-                b"title" => in_title = true,
-                _ => {}
-            },
-            Ok(Event::Text(e)) => {
-                if in_title {
-                    let txt = e.unescape()?.to_string();
-                    if current_href.is_none() {
-                        if let Some(last) = path_stack.last_mut() {
-                            *last = txt;
-                        }
-                    }
-                }
-            }
-            Ok(Event::End(e)) => match e.name().as_ref() {
-                b"folder" => {
-                    path_stack.pop();
-                }
-                b"bookmark" => {
-                    if let Some(href) = current_href.take() {
-                        let location = if path_stack.is_empty() {
-                            "Root".to_string()
-                        } else {
-                            path_stack.join(" > ")
-                        };
-                        tracker.entry(href).or_default().push(location);
-                    }
-                }
-                b"title" => in_title = false,
-                _ => {}
-            },
-            Ok(Event::Eof) => break,
-            _ => {}
-        }
-        buf.clear();
-    }
-
-    let mut found = false;
-    for (url, paths) in tracker {
-        if paths.len() > 1 {
-            found = true;
-            println!("---------------------------------------------------");
-            println!("⚠️  Duplicate Found (x{}): {}", paths.len(), url);
-            for (i, p) in paths.iter().enumerate() {
-                println!("   {}. {}", i + 1, p);
-            }
-        }
-    }
-
-    if found {
-        println!("---------------------------------------------------");
-        println!("❗ WARNING: Syncing now will keep ONLY the LAST occurrence.");
-    } else {
-        println!("✅ No remote duplicates.");
-    }
-    Ok(())
-}
-
-// ==========================================
-// 解析器与生成器 (保持不变)
-// ==========================================
-
-fn parse_xbel_stream(xml: &str) -> Result<HashMap<String, Bookmark>> {
-    if xml.trim().is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    let mut reader = Reader::from_str(xml);
-    reader.trim_text(true);
-    reader.expand_empty_elements(true);
-
-    let mut buf = Vec::new();
-    let mut map = HashMap::new();
-    let mut path_stack: Vec<String> = Vec::new();
-    let mut global_counter: u64 = 0;
-
-    let mut current_href: Option<String> = None;
-    let mut in_title = false;
-
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => {
-                match e.name().as_ref() {
-                    b"folder" => {
-                        path_stack.push("Untitled".to_string());
-                    }
-                    b"bookmark" => {
-                        for attr in e.attributes() {
-                            if let Ok(a) = attr {
-                                if a.key.as_ref() == b"href" {
-                                    // 获取原始字符串
-                                    let raw = String::from_utf8_lossy(&a.value).to_string();
-                                    // 🔥 强力清洗
-                                    let clean = html_decode(&raw);
-                                    current_href = Some(clean);
-                                }
-                            }
-                        }
-                    }
-                    b"title" => {
-                        in_title = true;
-                    }
-                    _ => {}
-                }
-            }
-            Ok(Event::Text(e)) => {
-                if in_title {
-                    let txt = e.unescape()?.to_string();
-                    if let Some(ref href) = current_href {
-                        global_counter += 1;
-                        let filtered_path: Vec<String> = path_stack
-                            .iter()
-                            .filter(|p| {
-                                *p != FOLDER_BAR && *p != FOLDER_MENU && *p != FOLDER_MOBILE
-                            })
-                            .cloned()
-                            .collect();
-                        map.insert(
-                            href.clone(),
-                            Bookmark {
-                                url: href.clone(),
-                                title: txt,
-                                path: filtered_path,
-                                order_id: global_counter,
-                            },
-                        );
-                    } else {
-                        if let Some(last) = path_stack.last_mut() {
-                            *last = txt;
-                        }
-                    }
-                }
-            }
-            Ok(Event::End(e)) => match e.name().as_ref() {
-                b"folder" => {
-                    path_stack.pop();
-                }
-                b"bookmark" => {
-                    if let Some(href) = current_href.take() {
-                        if !map.contains_key(&href) {
-                            global_counter += 1;
-                            let filtered_path: Vec<String> = path_stack
-                                .iter()
-                                .filter(|p| {
-                                    *p != FOLDER_BAR && *p != FOLDER_MENU && *p != FOLDER_MOBILE
-                                })
-                                .cloned()
-                                .collect();
-                            map.insert(
-                                href.clone(),
-                                Bookmark {
-                                    url: href.clone(),
-                                    title: href,
-                                    path: filtered_path,
-                                    order_id: global_counter,
-                                },
-                            );
-                        }
-                    }
-                }
-                b"title" => {
-                    in_title = false;
-                }
-                _ => {}
-            },
-            Ok(Event::Eof) => break,
-            _ => {}
-        }
-        buf.clear();
     }
     Ok(map)
 }
 
+// 防止多重转义导致的幽灵删除
 fn html_decode(s: &str) -> String {
     if !s.contains('&') {
         return s.to_string();
@@ -686,181 +134,634 @@ fn html_decode(s: &str) -> String {
     current
 }
 
-fn parse_qutebrowser_file(path: &PathBuf) -> Result<HashMap<String, Bookmark>> {
-    if !path.exists() {
-        return Err(anyhow::anyhow!(
-            "CRITICAL: Local bookmarks file not found at: {:?}\n\
-             Please check your 'local_path' config or manually create the file.", 
-            path
-        ));
-    }
-
-    let reader = BufReader::new(File::open(path)?);
+// 这里的 Map 仅用于逻辑对比 (Diff)，不会用于回写
+fn parse_remote_xml_dom(xml_content: &str) -> Result<HashMap<String, Bookmark>> {
     let mut map = HashMap::new();
+    // 如果文件为空，直接返回空 map
+    if xml_content.trim().is_empty() {
+        return Ok(map);
+    }
 
-    for line in reader.lines() {
-        let line = line?;
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
+    let root = Element::parse(xml_content.as_bytes())?;
+    let mut path_stack: Vec<String> = Vec::new();
 
-        if let Some((url, raw_title)) = line.split_once(' ') {
-            let parts: Vec<&str> = raw_title.split(SEPARATOR).collect();
-            let (path, title) = if parts.len() > 1 {
-                let t = parts.last().unwrap().to_string();
-                let p = parts[0..parts.len() - 1]
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect();
-                (p, t)
-            } else {
-                (vec![], raw_title.to_string())
-            };
-            map.insert(
-                url.to_string(),
-                Bookmark {
-                    url: url.to_string(),
-                    title,
-                    path,
-                    order_id: 0,
-                },
-            );
+    // 递归遍历 DOM 树
+    fn traverse(elem: &Element, stack: &mut Vec<String>, map: &mut HashMap<String, Bookmark>) {
+        if elem.name == "folder" {
+            let title = elem
+                .get_child("title")
+                .and_then(|t| t.get_text())
+                .unwrap_or(std::borrow::Cow::Borrowed("Untitled"))
+                .to_string();
+
+            stack.push(title);
+            for child in &elem.children {
+                if let XMLNode::Element(e) = child {
+                    traverse(e, stack, map);
+                }
+            }
+            stack.pop();
+        } else if elem.name == "bookmark" {
+            if let Some(raw_href) = elem.attributes.get("href") {
+                // 这里的 raw_href 已经被 xmltree 解码过一次了，
+                // 但为了防止双重转义脏数据，必须再次通过 html_decode 清洗
+                let href = html_decode(raw_href);
+
+                let raw_title = elem
+                    .get_child("title")
+                    .and_then(|t| t.get_text())
+                    .unwrap_or(std::borrow::Cow::Borrowed(""))
+                    .to_string();
+                // 标题也清洗一下
+                let title = html_decode(&raw_title);
+
+                let mut p = stack.clone();
+                if !p.is_empty() && p[0] == FOLDER_BAR {
+                    p.remove(0);
+                }
+
+                map.insert(
+                    href.clone(),
+                    Bookmark {
+                        url: href, // 使用清洗后的 url
+                        title,     // 使用清洗后的 title
+                        path: p,
+                    },
+                );
+            }
+        } else if elem.name == "xbel" {
+            for child in &elem.children {
+                if let XMLNode::Element(e) = child {
+                    traverse(e, stack, map);
+                }
+            }
         }
     }
+
+    traverse(&root, &mut path_stack, &mut map);
     Ok(map)
 }
 
-fn generate_sorted_qutebrowser_content(map: &HashMap<String, Bookmark>) -> String {
-    let mut list: Vec<&Bookmark> = map.values().collect();
-    list.sort_by(|a, b| a.path.cmp(&b.path).then(a.title.cmp(&b.title)));
+// 查重功能 (使用 DOM 解析，绝对安全且准确)
+fn check_duplicates(local_path: &PathBuf, xml_content: &str) -> Result<()> {
+    println!("🔍 Checking for duplicates...");
+    let mut found_issues = false;
 
-    let mut lines = Vec::new();
-    for bm in list {
+    // 1. 检查本地重复
+    if local_path.exists() {
+        let reader = BufReader::new(File::open(local_path)?);
+        let mut local_tracker: HashMap<String, Vec<usize>> = HashMap::new();
+
+        for (idx, line) in reader.lines().enumerate() {
+            let line = line?;
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if let Some((url, _)) = line.split_once(' ') {
+                local_tracker
+                    .entry(url.to_string())
+                    .or_default()
+                    .push(idx + 1);
+            }
+        }
+
+        for (url, lines) in local_tracker {
+            if lines.len() > 1 {
+                found_issues = true;
+                println!("⚠️  [Local Duplicate] {}", url);
+                println!("    Lines: {:?}", lines);
+            }
+        }
+    }
+
+    // 2. 检查远程重复
+    let root = Element::parse(xml_content.as_bytes())?;
+    let mut remote_tracker: HashMap<String, Vec<String>> = HashMap::new();
+    let mut path_stack: Vec<String> = Vec::new();
+
+    fn traverse_check(
+        elem: &Element,
+        stack: &mut Vec<String>,
+        tracker: &mut HashMap<String, Vec<String>>,
+    ) {
+        if elem.name == "folder" {
+            let title = elem
+                .get_child("title")
+                .and_then(|t| t.get_text())
+                .unwrap_or(std::borrow::Cow::Borrowed("Untitled"))
+                .to_string();
+
+            stack.push(title);
+            for child in &elem.children {
+                if let XMLNode::Element(e) = child {
+                    traverse_check(e, stack, tracker);
+                }
+            }
+            stack.pop();
+        } else if elem.name == "bookmark" {
+            if let Some(raw_href) = elem.attributes.get("href") {
+                let href = html_decode(raw_href);
+                let location = if stack.is_empty() {
+                    "Root".to_string()
+                } else {
+                    stack.join(" > ")
+                };
+                tracker.entry(href).or_default().push(location);
+            }
+        } else if elem.name == "xbel" {
+            for child in &elem.children {
+                if let XMLNode::Element(e) = child {
+                    traverse_check(e, stack, tracker);
+                }
+            }
+        }
+    }
+
+    traverse_check(&root, &mut path_stack, &mut remote_tracker);
+
+    for (url, locs) in remote_tracker {
+        if locs.len() > 1 {
+            found_issues = true;
+            println!("⚠️  [Remote Duplicate] {}", url);
+            for (i, loc) in locs.iter().enumerate() {
+                println!("    {}. {}", i + 1, loc);
+            }
+        }
+    }
+
+    if !found_issues {
+        println!("✅ No duplicates found.");
+    } else {
+        println!("❗ Note: Qutebrowser will use the LAST occurrence locally. Remote WebDAV duplicates are PRESERVED (not merged).");
+    }
+    Ok(())
+}
+
+// ==========================================
+// 2. DOM 操作逻辑 (Writer)
+// ==========================================
+
+fn find_max_id(element: &Element) -> i32 {
+    let mut max_id = 0;
+    if let Some(id_str) = element.attributes.get("id") {
+        if let Ok(id_val) = id_str.parse::<i32>() {
+            max_id = max_id.max(id_val);
+        }
+    }
+    for child in &element.children {
+        if let XMLNode::Element(child_elem) = child {
+            max_id = max_id.max(find_max_id(child_elem));
+        }
+    }
+    max_id
+}
+
+fn ensure_path_recursive<'a>(
+    current_node: &'a mut Element,
+    path_segments: &[String],
+    id_counter: &mut i32,
+) -> Result<&'a mut Element> {
+    if path_segments.is_empty() {
+        return Ok(current_node);
+    }
+    let folder_name = &path_segments[0];
+
+    let mut exists = false;
+    for child in &current_node.children {
+        if let XMLNode::Element(elem) = child {
+            if elem.name == "folder" {
+                if let Some(title_elem) = elem.get_child("title") {
+                    if let Some(text) = title_elem.get_text() {
+                        if text == *folder_name {
+                            exists = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if !exists {
+        let new_id = match folder_name.as_str() {
+            FOLDER_MOBILE => 1,
+            FOLDER_BAR => 2,
+            FOLDER_MENU => 3,
+            FOLDER_OTHER => 4,
+            _ => {
+                *id_counter += 1;
+                *id_counter
+            }
+        };
+        if new_id > *id_counter {
+            *id_counter = new_id;
+        }
+
+        let mut new_folder = Element::new("folder");
+        new_folder
+            .attributes
+            .insert("id".to_string(), new_id.to_string());
+        let mut title_node = Element::new("title");
+        title_node.children.push(XMLNode::Text(folder_name.clone()));
+        new_folder.children.push(XMLNode::Element(title_node));
+        current_node.children.push(XMLNode::Element(new_folder));
+    }
+
+    for child in &mut current_node.children {
+        if let XMLNode::Element(elem) = child {
+            if elem.name == "folder" {
+                if let Some(title_elem) = elem.get_child("title") {
+                    if let Some(text) = title_elem.get_text() {
+                        if text == *folder_name {
+                            return ensure_path_recursive(elem, &path_segments[1..], id_counter);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Err(anyhow::anyhow!("Logic error: created folder not found"))
+}
+
+fn insert_bookmark_to_dom(root: &mut Element, bm: &Bookmark, id_counter: &mut i32) -> Result<()> {
+    let mut full_path = bm.path.clone();
+    if full_path.is_empty()
+        || (full_path[0] != FOLDER_BAR
+            && full_path[0] != FOLDER_OTHER
+            && full_path[0] != FOLDER_MOBILE
+            && full_path[0] != FOLDER_MENU)
+    {
+        full_path.insert(0, FOLDER_BAR.to_string());
+    }
+
+    let target_folder = ensure_path_recursive(root, &full_path, id_counter)?;
+
+    for child in &target_folder.children {
+        if let XMLNode::Element(elem) = child {
+            if elem.name == "bookmark" {
+                if let Some(href) = elem.attributes.get("href") {
+                    if href == &bm.url {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
+
+    *id_counter += 1;
+    let mut bm_elem = Element::new("bookmark");
+    bm_elem
+        .attributes
+        .insert("href".to_string(), bm.url.clone());
+    bm_elem
+        .attributes
+        .insert("id".to_string(), id_counter.to_string());
+    let mut title_elem = Element::new("title");
+    title_elem.children.push(XMLNode::Text(bm.title.clone()));
+    bm_elem.children.push(XMLNode::Element(title_elem));
+
+    target_folder.children.push(XMLNode::Element(bm_elem));
+    Ok(())
+}
+
+fn delete_bookmark_from_dom(element: &mut Element, url: &str) -> bool {
+    let initial_len = element.children.len();
+    element.children.retain(|child| {
+        if let XMLNode::Element(elem) = child {
+            if elem.name == "bookmark" {
+                if let Some(href) = elem.attributes.get("href") {
+                    return href != url;
+                }
+            }
+        }
+        true
+    });
+
+    if element.children.len() < initial_len {
+        return true;
+    }
+
+    for child in &mut element.children {
+        if let XMLNode::Element(elem) = child {
+            if elem.name == "folder" {
+                if delete_bookmark_from_dom(elem, url) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+// ==========================================
+// 3. 凭证与网络
+// ==========================================
+
+fn resolve_credential(val: &Option<String>, cmd: &Option<String>, name: &str) -> Result<String> {
+    if let Some(v) = val {
+        return Ok(v.clone());
+    }
+    if let Some(c) = cmd {
+        let output = if cfg!(target_os = "windows") {
+            Command::new("cmd").args(["/C", c]).output()?
+        } else {
+            Command::new("sh").args(["-c", c]).output()?
+        };
+        if !output.status.success() {
+            return Err(anyhow::anyhow!(
+                "Cmd failed for {}: {}",
+                name,
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        return Ok(String::from_utf8(output.stdout)?.trim().to_string());
+    }
+    Err(anyhow::anyhow!("Missing config for {}", name))
+}
+
+fn fetch_remote(
+    config: &AppConfig,
+    target_url: &str,
+) -> Result<(String, SystemTime, String, String)> {
+    let user = resolve_credential(
+        &config.webdav.username,
+        &config.webdav.username_cmd,
+        "username",
+    )?;
+    let pass = resolve_credential(
+        &config.webdav.password,
+        &config.webdav.password_cmd,
+        "password",
+    )?;
+
+    println!("☁️  Fetching remote: {}", target_url);
+    let client = Client::new();
+    let resp = client
+        .get(target_url)
+        .basic_auth(&user, Some(&pass))
+        .send()?;
+
+    if !resp.status().is_success() {
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(anyhow::anyhow!("CRITICAL: Remote file not found (404) at: {}\nPlease create an empty 'bookmarks.xbel' on your WebDAV server first.", target_url));
+        }
+        return Err(anyhow::anyhow!("Remote fetch failed: {}", resp.status()));
+    }
+
+    let last_modified = resp
+        .headers()
+        .get(LAST_MODIFIED)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| httpdate::parse_http_date(s).ok())
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+
+    Ok((resp.text()?, last_modified, user, pass))
+}
+
+// ==========================================
+// 4. 主同步逻辑
+// ==========================================
+
+fn sync_once(
+    config: &AppConfig,
+    local_path: &PathBuf,
+    snapshot_path: &PathBuf,
+    target_url: &str,
+) -> Result<()> {
+    println!("🔄 Syncing...");
+
+    // 1. 读取各方状态
+    let local_map = parse_local_file(local_path)?;
+    let (remote_xml_str, _, username, password) = fetch_remote(config, target_url)?;
+
+    let remote_map = parse_remote_xml_dom(&remote_xml_str)?;
+
+    let snapshot_map: HashMap<String, Bookmark> = if snapshot_path.exists() {
+        let f = File::open(snapshot_path)?;
+        serde_json::from_reader(BufReader::new(f)).unwrap_or_default()
+    } else {
+        HashMap::new()
+    };
+
+    println!(
+        "📊 Stats: Local={}, Remote={}, Snapshot={}",
+        local_map.len(),
+        remote_map.len(),
+        snapshot_map.len()
+    );
+
+    let mut to_add_to_remote: Vec<Bookmark> = Vec::new();
+    let mut to_delete_from_remote: Vec<String> = Vec::new();
+    let mut final_local_map = local_map.clone();
+
+    let mut all_urls: HashSet<String> = HashSet::new();
+    all_urls.extend(local_map.keys().cloned());
+    all_urls.extend(remote_map.keys().cloned());
+    all_urls.extend(snapshot_map.keys().cloned());
+
+    let mut dom_dirty = false;
+    let mut root_element = Element::parse(remote_xml_str.as_bytes())?;
+    let mut max_id = find_max_id(&root_element);
+
+    let fmt_path = |p: &[String]| -> String {
+        if p.is_empty() {
+            FOLDER_BAR.to_string()
+        } else {
+            p.join("/")
+        }
+    };
+
+    for url in all_urls {
+        let in_local = local_map.get(&url);
+        let in_remote = remote_map.get(&url); // 现在是 100% 准确的
+        let in_snap = snapshot_map.get(&url);
+
+        match (in_local, in_remote, in_snap) {
+            (Some(l), Some(r), Some(s)) => {
+                if l.path != r.path {
+                    if l.path != s.path {
+                        println!(
+                            "   🔄 Moving remote: {} ({} -> {})",
+                            l.title,
+                            fmt_path(&s.path),
+                            fmt_path(&l.path)
+                        );
+                        to_delete_from_remote.push(url.clone());
+                        to_add_to_remote.push(l.clone());
+                    } else if r.path != s.path {
+                        println!(
+                            "   🔄 Moving local: {} ({} -> {})",
+                            r.title,
+                            fmt_path(&s.path),
+                            fmt_path(&r.path)
+                        );
+                        final_local_map.insert(url.clone(), r.clone());
+                    } else {
+                        println!("   ⚠️ Conflict move, preferring local: {}", l.title);
+                        to_delete_from_remote.push(url.clone());
+                        to_add_to_remote.push(l.clone());
+                    }
+                } else if l.title != r.title {
+                    if l.title != s.title {
+                        println!("   ✏️ Renaming remote: {} -> {}", s.title, l.title);
+                        to_delete_from_remote.push(url.clone());
+                        to_add_to_remote.push(l.clone());
+                    } else if r.title != s.title {
+                        println!("   ✏️ Renaming local: {} -> {}", s.title, r.title);
+                        final_local_map.insert(url.clone(), r.clone());
+                    }
+                }
+            }
+
+            (Some(l), Some(r), None) => {
+                if l.path != r.path {
+                    println!(
+                        "   🔄 Syncing structure (prefer local): {} ({} -> {})",
+                        l.title,
+                        fmt_path(&r.path),
+                        fmt_path(&l.path)
+                    );
+                    to_delete_from_remote.push(url.clone());
+                    to_add_to_remote.push(l.clone());
+                }
+            }
+
+            (Some(l), None, None) => {
+                println!("   🚀 Pushing new: {}", l.title);
+                to_add_to_remote.push(l.clone());
+            }
+            (None, Some(r), None) => {
+                println!("   📥 Pulling new: {}", r.title);
+                final_local_map.insert(url.clone(), r.clone());
+            }
+            (None, Some(_), Some(_)) => {
+                println!("   🗑️ Deleting remote: {}", url);
+                to_delete_from_remote.push(url.clone());
+            }
+            (Some(_), None, Some(_)) => {
+                println!("   🗑️ Deleting local: {}", url);
+                final_local_map.remove(&url);
+            }
+            _ => {}
+        }
+    }
+
+    for url in to_delete_from_remote {
+        if delete_bookmark_from_dom(&mut root_element, &url) {
+            dom_dirty = true;
+        }
+    }
+    for bm in to_add_to_remote {
+        insert_bookmark_to_dom(&mut root_element, &bm, &mut max_id)?;
+        dom_dirty = true;
+    }
+
+    let mut sorted_bookmarks: Vec<&Bookmark> = final_local_map.values().collect();
+    sorted_bookmarks.sort_by(|a, b| a.path.cmp(&b.path).then(a.title.cmp(&b.title)));
+
+    let mut local_lines = Vec::new();
+    for bm in sorted_bookmarks {
         let full_title = if bm.path.is_empty() {
             bm.title.clone()
         } else {
             format!("{}{}{}", bm.path.join(SEPARATOR), SEPARATOR, bm.title)
         };
-        lines.push(format!("{} {}", bm.url, full_title));
+        local_lines.push(format!("{} {}", bm.url, full_title));
     }
-    lines.join("\n")
-}
+    fs::write(local_path, local_lines.join("\n"))?;
 
-struct XbelNode {
-    id: i32,
-    title: String,
-    children: BTreeMap<String, XbelNode>,
-    bookmarks: Vec<Bookmark>,
-}
-impl XbelNode {
-    fn new(title: &str, id: i32) -> Self {
-        Self {
-            id,
-            title: title.to_string(),
-            children: BTreeMap::new(),
-            bookmarks: Vec::new(),
-        }
+    if dom_dirty {
+        let mut buffer = Vec::new();
+        let xml_cfg = EmitterConfig::new()
+            .perform_indent(true)
+            .indent_string("  ")
+            .write_document_declaration(false);
+        buffer.extend_from_slice(b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+        buffer.extend_from_slice(b"<!DOCTYPE xbel PUBLIC \"+//IDN python.org//DTD XML Bookmark Exchange Language 1.0//EN//XML\" \"http://pyxml.sourceforge.net/topics/dtds/xbel.dtd\">\n");
+        root_element.write_with_config(&mut buffer, xml_cfg)?;
+
+        println!("☁️  Uploading changes to WebDAV...");
+        Client::new()
+            .put(target_url)
+            .basic_auth(username, Some(password))
+            .body(buffer)
+            .send()?;
     }
+
+    let f = File::create(snapshot_path)?;
+    serde_json::to_writer(f, &final_local_map)?;
+
+    println!("✅ Sync Complete.");
+    Ok(())
 }
 
-fn generate_xbel_content(map: &HashMap<String, Bookmark>) -> Result<String> {
-    let mut writer = Writer::new_with_indent(Cursor::new(Vec::new()), b' ', 2);
+// ==========================================
+// Main
+// ==========================================
 
-    writer.write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), None)))?;
-    writer.write_event(Event::DocType(BytesText::from_escaped(
-        "xbel PUBLIC \"+//IDN python.org//DTD XML Bookmark Exchange Language 1.0//EN//XML\" \"http://pyxml.sourceforge.net/topics/dtds/xbel.dtd\""
-    )))?;
+fn main() -> Result<()> {
+    let args: Vec<String> = env::args().collect();
+    let is_check_mode = args.contains(&"--check-dupe".to_string());
 
-    let root_start = BytesStart::new("xbel").with_attributes(vec![("version", "1.0")]);
-    writer.write_event(Event::Start(root_start))?;
+    if is_check_mode {
+        println!("🔍 Starting Duplicate Check Mode...");
+    } else {
+        println!("🚀 Starting qb-floccus");
+    }
 
-    let mut id_counter = 100;
-    let mut root_folders: BTreeMap<String, XbelNode> = BTreeMap::new();
-    root_folders.insert(FOLDER_BAR.to_string(), XbelNode::new(FOLDER_BAR, 2));
-    root_folders.insert(FOLDER_OTHER.to_string(), XbelNode::new(FOLDER_OTHER, 4));
+    let home = dirs::home_dir().context("No home dir")?;
+    let qb_config_dir = if cfg!(target_os = "windows") {
+        home.join("AppData").join("Roaming").join("qutebrowser")
+    } else {
+        home.join(".config").join("qutebrowser")
+    };
 
-    for bm in map.values() {
-        let mut target_node: &mut XbelNode;
-        if bm.path.is_empty() {
-            target_node = root_folders.get_mut(FOLDER_BAR).unwrap();
-        } else {
-            let root_name = &bm.path[0];
-            if !root_folders.contains_key(root_name) {
-                let id = match root_name.as_str() {
-                    FOLDER_MENU => 3,
-                    FOLDER_MOBILE => 1,
-                    _ => {
-                        id_counter += 1;
-                        id_counter
-                    }
-                };
-                root_folders.insert(root_name.clone(), XbelNode::new(root_name, id));
-            }
-            target_node = root_folders.get_mut(root_name).unwrap();
+    let config_path = qb_config_dir.join("qb-floccus.toml");
+    if !config_path.exists() {
+        return Err(anyhow::anyhow!("Config file not found: {:?}", config_path));
+    }
+    let config_str = fs::read_to_string(&config_path)?;
+    let config: AppConfig = toml::from_str(&config_str)?;
 
-            for sub_name in &bm.path[1..] {
-                if !target_node.children.contains_key(sub_name) {
-                    id_counter += 1;
-                    target_node
-                        .children
-                        .insert(sub_name.clone(), XbelNode::new(sub_name, id_counter));
+    let local_path = config
+        .local_path
+        .as_ref()
+        .map(PathBuf::from)
+        .unwrap_or(qb_config_dir.join("bookmarks").join("urls"));
+
+    let cache_dir = if cfg!(target_os = "windows") {
+        home.join("AppData").join("Local").join("qb-floccus")
+    } else {
+        home.join(".cache").join("qb-floccus")
+    };
+    fs::create_dir_all(&cache_dir)?;
+    let snapshot_path = cache_dir.join("snapshot.json");
+
+    let target_url = get_target_url(&config.webdav.url);
+
+    if is_check_mode {
+        let (remote_xml, _, _, _) = fetch_remote(&config, &target_url)?;
+        check_duplicates(&local_path, &remote_xml)?;
+        return Ok(());
+    }
+
+    if let Some(interval) = config.interval {
+        println!("🚀 Daemon Mode ({}s)...", interval);
+        loop {
+            if let Err(e) = sync_once(&config, &local_path, &snapshot_path, &target_url) {
+                eprintln!("❌ Error: {}", e);
+                let err_msg = e.to_string();
+                if err_msg.contains("CRITICAL") || err_msg.contains("401") {
+                    eprintln!("🛑 Fatal error detected. Daemon stopped.");
+                    std::process::exit(1);
                 }
-                target_node = target_node.children.get_mut(sub_name).unwrap();
             }
+            thread::sleep(Duration::from_secs(interval));
         }
-        target_node.bookmarks.push(bm.clone());
+    } else {
+        sync_once(&config, &local_path, &snapshot_path, &target_url)?;
     }
 
-    fn write_node(
-        writer: &mut Writer<Cursor<Vec<u8>>>,
-        node: &XbelNode,
-        id_gen: &mut i32,
-    ) -> Result<()> {
-        let mut folder_start = BytesStart::new("folder");
-        folder_start.push_attribute(("id", node.id.to_string().as_str()));
-        writer.write_event(Event::Start(folder_start))?;
-
-        writer.write_event(Event::Start(BytesStart::new("title")))?;
-        writer.write_event(Event::Text(BytesText::new(&node.title)))?;
-        writer.write_event(Event::End(BytesEnd::new("title")))?;
-
-        for child in node.children.values() {
-            write_node(writer, child, id_gen)?;
-        }
-
-        let mut sorted = node.bookmarks.clone();
-        sorted.sort_by(|a, b| a.order_id.cmp(&b.order_id));
-
-        for bm in sorted {
-            *id_gen += 1;
-            let mut bm_start = BytesStart::new("bookmark");
-            bm_start.push_attribute(("href", bm.url.as_str()));
-            bm_start.push_attribute(("id", id_gen.to_string().as_str()));
-            writer.write_event(Event::Start(bm_start))?;
-
-            writer.write_event(Event::Start(BytesStart::new("title")))?;
-            writer.write_event(Event::Text(BytesText::new(&bm.title)))?;
-            writer.write_event(Event::End(BytesEnd::new("title")))?;
-
-            writer.write_event(Event::End(BytesEnd::new("bookmark")))?;
-        }
-        writer.write_event(Event::End(BytesEnd::new("folder")))?;
-        Ok(())
-    }
-
-    if let Some(node) = root_folders.get(FOLDER_BAR) {
-        write_node(&mut writer, node, &mut id_counter)?;
-    }
-    if let Some(node) = root_folders.get(FOLDER_OTHER) {
-        write_node(&mut writer, node, &mut id_counter)?;
-    }
-    for (name, node) in &root_folders {
-        if name != FOLDER_BAR && name != FOLDER_OTHER {
-            write_node(&mut writer, node, &mut id_counter)?;
-        }
-    }
-
-    writer.write_event(Event::End(BytesEnd::new("xbel")))?;
-    Ok(String::from_utf8(writer.into_inner().into_inner())?)
+    Ok(())
 }

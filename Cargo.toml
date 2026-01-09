@@ -1,16 +1,16 @@
 [package]
 name = "qb-floccus"
-version = "0.14.0"
+version = "0.2.2"
 edition = "2021"
 
 [dependencies]
 anyhow = "1.0"
 reqwest = { version = "0.11", features = ["blocking", "rustls-tls"] }
-roxmltree = "0.19"
-quick-xml = "0.31"
+xmltree = "0.10"
+regex = "1.10"
+lazy_static = "1.4"
 dirs = "5.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-chrono = "0.4"
 httpdate = "1.0"
 toml = "0.8"

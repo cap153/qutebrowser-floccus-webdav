@@ -2,59 +2,81 @@
 
 [![Rust](https://img.shields.io/badge/Language-Rust-orange.svg)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](#LICENSE)
-[中文文档](README_CN.md)
+[中文](README_CN.md)
 
-**qb-floccus** is a high-performance, bidirectional bookmark synchronization tool written specifically for **Qutebrowser**.
+**qb-floccus** is a high-performance, two-way bookmark synchronization tool written specifically for **Qutebrowser**.
 
-It uses the **WebDAV protocol** to sync standard **XBEL (XML Bookmark Exchange Language)** files, bridging the data gap between Qutebrowser (plain text bookmarks) and other browsers (via the Floccus extension), enabling cross-computer synchronization of bookmark hierarchy and order.
+It synchronizes standard **XBEL (XML Bookmark Exchange Language)** files via the **WebDAV protocol**, bridging the data gap between Qutebrowser (plain text bookmarks) and other browsers (via the Floccus extension), enabling cross-computer bookmark hierarchy synchronization.
 
 ---
 
-## ⚠️ Risk Warning & Disclaimer (MUST READ)
+## ⚠️ Risk Warning & Disclaimer (Must Read)
 
-**This software involves OVERWRITING, WRITING, and DELETING your local files and remote cloud data.**
+**By using this software, you acknowledge and accept that this software involves [OVERWRITING], [WRITING], and [DELETING] operations on your local files and remote cloud data.**
 
-Although we have introduced mechanisms such as snapshots, circuit breakers, and status code validation during development, **software bugs, network anomalies, or configuration errors may still result in data loss.**
+**This software is provided "AS IS", without warranty of any kind, express or implied (including but not limited to merchantability or fitness for a particular purpose). In no event shall the author be liable for any data loss, file corruption, business interruption, or any other commercial damages or losses arising out of the use or inability to use this software, even if the author has been advised of the possibility of such damages.**
+
+Although we have introduced safety measures such as snapshot mechanisms, circuit breakers, and status code validation during development, **software defects, network anomalies, or configuration errors may still lead to data loss.**
 
 Before using this software, you must understand and accept the following risks:
 
-1.  **Sync Logic Risks**: This tool supports "bidirectional deletion". If you mistakenly clear bookmarks on one end and the snapshot mechanism fails to intercept it, this "clearing" operation may be synced to the other end.
-2.  **Network Transmission Risks**: Extreme network fluctuations during upload/download may cause XML file truncation or corruption (although WebDAV PUT is usually atomic, it depends on the server implementation).
-3.  **Configuration Error Risks**: Incorrect WebDAV URLs or permission settings may cause the program to misjudge the file status, triggering incorrect sync logic.
-4.  **Concurrency Conflicts**: If multiple devices modify the same bookmark simultaneously, this tool adopts a "Last Write Wins" strategy, meaning older changes will be overwritten.
+1.  **Sync Logic Risk**: This tool supports "two-way deletion." If you mistakenly clear bookmarks at one end and the snapshot mechanism fails to intercept it, this "clear" operation **will** be synced to the other end.
+2.  **Network Transmission Risk**: Extreme network fluctuations during upload/download may cause XML file truncation or corruption.
+3.  **Configuration Error Risk**: Incorrect WebDAV URLs or permission configurations may cause the program to misjudge file status.
+4.  **Concurrency Conflict**: If multiple devices modify the same bookmark within two sync intervals (e.g., moving it to different folders), this tool adopts a **"Local Wins"** strategy, forcing the **local state of the Qutebrowser running this tool** to prevail and overwrite modifications on the remote end.
 
-**🛡️ User Responsibilities:**
-*   **Format Confirmation**: Please ensure your Floccus plugin is set to use **XBEL** format (this is the default). HTML format is not supported.
-*   **Backup**: You must periodically backup your local `~/.config/qutebrowser/bookmarks/urls` and the remote `bookmarks.xbel`.
-*   **Self-Check**: Please run `--check-dupe` before the first run to inspect data status.
+**🛡️ User Responsibility:**
 
-**THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED. THE AUTHOR IS NOT LIABLE FOR ANY DATA LOSS, DAMAGES, OR BUSINESS INTERRUPTION RESULTING FROM THE USE OF THIS SOFTWARE.**
+To ensure your data safety, please strictly abide by the following **User Responsibilities**:
+
+1.  **Backup Responsibility**: You are responsible for regularly backing up your local bookmarks (`~/.config/qutebrowser/bookmarks/urls`) and the remote WebDAV XML file (`bookmarks.xbel`). **Do not rely entirely on this tool's automation mechanisms.**
+2.  **Format Confirmation**: Please ensure your Floccus extension has **XBEL** selected in "File Format" (this is the default). **This tool does not support HTML format synchronization; forced execution may result in file content being incorrectly overwritten.**
+3.  **Self-Check Responsibility**: Before the first run, be sure to use the `--check-dupe` parameter to check the data status.
+
+---
+
+## ✅ v0.2.x Security Improvements
+
+In version v0.2.x, we refactored the core logic to reduce the above risks:
+*   **DOM Incremental Modification**: Deprecated full-rewrite mode. **Unmodified bookmark nodes (including duplicates) are preserved intact on the WebDAV end.**
+*   **Metadata Protection**: Perfectly preserves metadata generated by Floccus (UUID, creation time, parent ID, etc.) without destroying the XML structure.
+*   **Circuit Breaker Mechanism**: Built-in 404/401 error circuit breaker to prevent infinite loops caused by configuration errors.
 
 ---
 
 ## ✨ Features
 
-*   **⚡ Blazing Fast Sync**: Written in Rust with a minimal footprint. Supports bidirectional addition, deletion, and modification.
-*   **🛡️ 3-Way Merge**: Introduces a **Snapshot** mechanism to compare `Local vs Remote vs Snapshot`, accurately identifying and syncing "deletions" instead of simply overwriting.
-*   **📂 Hierarchy Mapping**: Uses a unique ` 📂 ` separator to map the WebDAV folder structure to Qutebrowser's flat titles, maintaining support for fuzzy search.
-*   **🔒 Secure Configuration**: Supports retrieving credentials dynamically via Shell commands (Environment variables, Pass, GPG, etc.). No plaintext passwords in config files.
-*   **🤖 Daemon Mode**: Built-in timer for scheduled syncing, eliminating the need for external Crontab or Systemd Timers.
+*   **⚡ Blazing Fast**: Written in Rust with extremely low resource usage.
+*   **🛡️ Non-Destructive Editing**: Uses a DOM parsing engine to **only modify changed bookmark nodes**, perfectly preserving Floccus IDs and custom metadata without destroying the original XML structure.
+*   **🔄 Three-Way Merge**: Introduces a Snapshot mechanism to support intelligent "Move" detection, accurately identifying and syncing "Add, Delete, Move, Rename" operations.
+*   **📂 Hierarchy Mapping**: Uniquely uses the ` 📂 ` separator to map the WebDAV folder structure to Qutebrowser's flat titles, preserving full directory hierarchy context.
+*   **🔒 Secure Configuration**: Supports dynamic credential retrieval via Shell commands (Environment variables, Pass, GPG, etc.); no plaintext in config files.
+*   **🤖 Daemon Process**: Built-in scheduled tasks (Daemon Mode) and error circuit breaker mechanism.
+
+### 💡 About Sorting and Moving
+*   **Moving**: Supports moving bookmarks between different folders; changes are synced automatically.
+*   **Sorting**: This tool **completely ignores** and **does not sync** custom sorting.
+    *   **Qutebrowser End**: Forced alphabetical sorting by `Folder > Title` (this is a native feature of Qutebrowser's local file).
+    *   **WebDAV End (Floccus)**: **Sorting within the same folder is free.** You can adjust bookmark order in Chrome/Firefox at will; this order **will not** be synced to Qutebrowser, nor will it be reset by this tool (unless you perform a move operation on that bookmark).
+    *   **New Bookmarks**: New bookmarks synced from Qutebrowser to WebDAV are appended to the **end** of the target folder by default.
+
+---
 
 ## 📦 Installation
 
-### Method 1: Build from Source & Auto Deploy
+### Method 1: Source Compilation & Auto Deployment
 
-Requires [Rust toolchain](https://rustup.rs/) installed. The Makefile will handle compilation, installation, and **Systemd service generation/registration**.
+If you have the [Rust toolchain](https://rustup.rs/) installed, the Makefile will handle compilation, installation, and **Systemd service generation and registration**.
 
 ```bash
 git clone https://github.com/cap153/qb-floccus.git
 cd qb-floccus
 
-# Compiles and installs to ~/.local/bin, and configures Systemd automatically
+# Compile and install to ~/.local/bin, and auto-configure Systemd
 make install
 
 systemctl --user daemon-reload
-# Start service and enable auto-start on boot
+# Start the service and enable auto-start on boot
 systemctl --user enable --now qb-floccus
 ```
 
@@ -72,19 +94,19 @@ After=network-online.target
 
 [Service]
 Type=simple
-# Please adjust the path according to your actual installation
+# Please modify the path according to your actual installation location
 ExecStart=%h/.local/bin/qb-floccus
 Restart=on-failure
 RestartSec=60s
 
-# Environment variable example (if you use env vars for credentials in config)
+# Environment variable example (if using environment variables for credentials in config)
 # Environment="WEBDAV_USER=myuser"
 
 [Install]
 WantedBy=default.target
 ```
 
-Enable the service and auto-start:
+Enable the service and set it to start on boot:
 
 ```bash
 systemctl --user daemon-reload
@@ -95,61 +117,59 @@ systemctl --user enable --now qb-floccus
 
 ## ⚙️ Configuration Guide
 
-Configuration file paths:
+Configuration file path:
 *   **Linux**: `~/.config/qutebrowser/qb-floccus.toml`
 *   **Windows**: `%APPDATA%\qutebrowser\qb-floccus.toml`
 
-### Configuration Template
+### Configuration File Template
 
 ```toml
-# You can specify the path to the local Qutebrowser bookmarks file.
-# Example for Windows:
+# You can specify the local qutebrowser bookmarks file path. For Windows:
 # local_path = 'C:\Users\Captain\AppData\Roaming\qutebrowser\config\bookmarks\urls'
 
-# Sync interval (seconds). Comment this line out for "Run-Once Mode".
+# Sync interval (seconds). Comment out this line for single-run mode.
 interval = 900
 
 [webdav]
-# Direct WebDAV server address (e.g., http://192.168.1.x:8080 is also accepted)
-# Must point to the bookmarks.xbel file eventually.
-url = "http://192.168.1.x:8080/bookmarks.xbel"
+# WebDAV Server URL
+# The program automatically identifies the URL. If it doesn't end with .xbel, /bookmarks.xbel is appended.
+url = "http://192.168.1.x:8080"
 
 # --- Credential Retrieval (Recommended) ---
-# Supports executing any Shell command; stdout is used as the credential.
-# Below are 3 examples:
-
-# Method 1: Read environment variable (Can be set in Systemd Environment)
+# Supports executing arbitrary Shell commands; stdout is used as the credential.
+# Method 1: Read environment variable (Can be configured in Systemd Environment)
 username_cmd = "echo $WEBDAV_USER"
-
-# Method 2: Read from encrypted storage (e.g., pass)
+# Method 2: Read encrypted storage (e.g., pass)
 password_cmd = "pass show webdav/sync"
-
-# Method 3: Read from a local file
+# Method 3: Read local file
 # password_cmd = "cat ~/.secret_pass"
 
-# --- Credential Retrieval (Plaintext / Not Recommended) ---
+# --- Credential Retrieval (Plaintext/Not Recommended) ---
 # username = "admin"
 # password = "123"
 ```
 
 ---
 
-## 🚀 First Run Recommendation
+## 🚀 First Run Recommendations
 
-Qutebrowser local bookmarks usually have no duplicates, but the WebDAV end often accumulates duplicate URLs due to multi-device syncing.
-**During synchronization, this tool automatically keeps the entry at the end of the file (usually the newest one).**
+Since Qutebrowser local bookmarks usually have no duplicates, while the WebDAV end often accumulates duplicate URLs due to multi-device syncing.
 
-It is recommended to run a duplicate check before the first sync to avoid accidental deletion of desired bookmarks:
+**Regarding Duplicate Handling Strategy (v0.2.x):**
+*   **Qutebrowser Local**: If remote duplicates exist, the local side only reads the *last* occurrence found in the XML.
+*   **WebDAV Remote**: **The program performs a read-only check and will not actively merge or delete remote duplicates.** Unless you explicitly delete the bookmark locally, remote duplicates remain preserved and unaffected.
+
+It is recommended to check for duplicates before the first run to understand your data status:
 
 ```bash
 qb-floccus --check-dupe
 ```
 
-This command only reads data without modifying it and outputs a detailed duplicate report.
+This command only reads and does not modify; it outputs a detailed report of duplicates.
 
 ## 🖥️ Windows Support Note
 
-The code logic of this project is designed to be fully compatible with Windows (including path handling and command execution), but **it has not been fully tested in a Windows environment**.
+The project's code logic is designed to be fully compatible with Windows (including path handling and command execution), but **has not yet been fully tested in a Windows environment**.
 
 ## Acknowledgments
 
