@@ -171,11 +171,11 @@ qb-floccus --check-dupe
 
 本项目代码逻辑在设计上完全兼容 Windows（包括路径处理、命令执行），但**尚未在 Windows 环境下进行完整测试**。
 
-## 致谢
+## 🙏 致谢
 
 *   感谢 [Floccus](https://github.com/floccusaddon/floccus) 项目实现跨浏览器同步。
 *   本项目是一个独立的实现，与 Floccus 使用的数据格式兼容，但不隶属于其开发人员。
 
-## License
+## 🪪 License
 
 [MIT](../LICENSE)

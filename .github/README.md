@@ -171,11 +171,11 @@ This command only reads and does not modify; it outputs a detailed report of dup
 
 The project's code logic is designed to be fully compatible with Windows (including path handling and command execution), but **has not yet been fully tested in a Windows environment**.
 
-## Acknowledgments
+## 🙏 Acknowledgments
 
 *   Thanks to the [Floccus](https://github.com/floccusaddon/floccus) project for enabling cross-browser synchronization.
 *   This project is an independent implementation compatible with the data format used by Floccus but is not affiliated with its developers.
 
-## License
+## 🪪 License
 
 [MIT](../LICENSE)
